@@ -1275,6 +1275,11 @@ struct TypeFlowSpecializationContext
     /// extract-existential analyses need that set to specialize against.
     IRInst* refineAbstractLeavesToInfo(IRInst* type)
     {
+        // Resolve a translated placeholder (e.g. an intermediate-context type) first so the
+        // refinement reaches the interface leaves inside the type it stands for; otherwise the
+        // placeholder resolves later into a second, unrefined spelling of the same info.
+        type = resolveTranslatedTypeInfo(type);
+
         if (auto interfaceType = as<IRInterfaceType>(type))
         {
             if (isComInterfaceType(interfaceType))
@@ -3654,7 +3659,13 @@ struct TypeFlowSpecializationContext
                         return;
                     }
 
-                    results.add(findWitnessTableEntry(witnessTab, key));
+                    auto entry = findWitnessTableEntry(witnessTab, key);
+                    // A type-valued entry is an info derived from a declared type; resolve and
+                    // refine it here so it has the same canonical spelling as infos arriving
+                    // from actual data flow, instead of a second raw-interface-leaf spelling.
+                    if (inst->getDataType()->getOp() == kIROp_TypeKind)
+                        entry = refineAbstractLeavesToInfo(entry);
+                    results.add(entry);
                 });
 
             auto setOp = getSetOpFromType(inst->getDataType());
