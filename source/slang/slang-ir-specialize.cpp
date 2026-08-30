@@ -1166,7 +1166,7 @@ struct SpecializationContext
                     addUsersToWorkList(lookupInst);
                     if (as<IRTypeSet>(newSet))
                     {
-                        lookupInst->replaceUsesWith(builder.getUntaggedUnionType(newSet));
+                        lookupInst->replaceUsesWith(getUntaggedUnionTypeForSet(&builder, newSet));
                         lookupInst->removeAndDeallocate();
                     }
                     else if (as<IRWitnessTableSet>(newSet))
@@ -3681,7 +3681,7 @@ IRInst* specializeGenericWithSetArgs(
             if (as<IRTypeType>(param->getDataType()))
             {
                 // TODO: This case should not happen anymore.
-                cloneEnv.mapOldValToNew[param] = builder.getUntaggedUnionType(set);
+                cloneEnv.mapOldValToNew[param] = getUntaggedUnionTypeForSet(&builder, set);
             }
             else if (as<IRWitnessTableType>(param->getDataType()))
             {

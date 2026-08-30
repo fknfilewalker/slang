@@ -164,13 +164,24 @@ struct CFGNormalizationPass
         return false;
     }
 
+    /// Return true if `var` may move into `destBlock` without placing a use of its type before
+    /// the type's definition. A local whose type is opened from an existential has a block-local
+    /// type instruction and must stay put: hoisting it creates a def-use break `legalizeDefUse`
+    /// cannot repair (cloning a hoistable inst returns the same deduplicated inst). Leaving it is
+    /// sound; the `legalizeDefUse` call at the end of `normalizeCFG` relocates it if needed.
+    bool canMoveVarToBlock(IRVar* var, IRBlock* destBlock)
+    {
+        auto typeParentBlock = as<IRBlock>(var->getFullType()->getParent());
+        return !typeParentBlock || typeParentBlock == destBlock;
+    }
+
     void _moveVarsToRegionHeader(BreakableRegionInfo* region, IRBlock* block)
     {
         for (auto child = block->getFirstChild(); child;)
         {
             auto nextChild = child->getNextInst();
 
-            if (as<IRVar>(child))
+            if (auto var = as<IRVar>(child))
             {
                 if (auto loopInst = as<IRLoop>(region->headerBlock->getTerminator()))
                 {
@@ -178,11 +189,15 @@ struct CFGNormalizationPass
                     // to the loop's target (first loop block) instead of the loop header.
                     // (unless the var is already in the header or target)
                     //
-                    if (block != region->headerBlock && block != loopInst->getTargetBlock())
-                        child->insertBefore(loopInst->getTargetBlock()->getTerminator());
+                    auto destBlock = loopInst->getTargetBlock();
+                    if (block != region->headerBlock && block != destBlock &&
+                        canMoveVarToBlock(var, destBlock))
+                        var->insertBefore(destBlock->getTerminator());
                 }
-                else
-                    child->insertBefore(region->headerBlock->getTerminator());
+                else if (canMoveVarToBlock(var, region->headerBlock))
+                {
+                    var->insertBefore(region->headerBlock->getTerminator());
+                }
             }
 
             child = nextChild;

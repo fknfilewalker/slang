@@ -7,6 +7,15 @@
 namespace Slang
 {
 
+IRType* getUntaggedUnionTypeForSet(IRBuilder* builder, IRInst* typeSet)
+{
+    auto set = cast<IRSetBase>(typeSet);
+    if (set->isSingleton())
+        return (IRType*)set->getElement(0);
+
+    return (IRType*)builder->getUntaggedUnionType(typeSet);
+}
+
 template<typename F>
 IRInst* openOptional(IRModule* module, IRInst* arg, F innerFunc)
 {
@@ -136,8 +145,10 @@ IRInst* upcastSet(IRBuilder* builder, IRInst* arg, IRType* destInfo)
                 upcastSet(builder, argTypeTag, builder->getSetTagType(destTUType->getTypeSet()));
 
             auto argVal = builder->emitGetValueFromTaggedUnion(arg);
-            auto reinterpretedVal =
-                upcastSet(builder, argVal, builder->getUntaggedUnionType(destTUType->getTypeSet()));
+            auto reinterpretedVal = upcastSet(
+                builder,
+                argVal,
+                getUntaggedUnionTypeForSet(builder, destTUType->getTypeSet()));
             return builder->emitMakeTaggedUnion(
                 destTUType,
                 reinterpretedTypeTag,

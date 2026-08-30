@@ -728,7 +728,29 @@ struct UntaggedUnionLoweringContext : public InstPassBase
         return true;
     }
 
-    void lowerUntaggedUnionType(IRUntaggedUnionType* untaggedUnionType)
+    /// Lower every `UntaggedUnionType` reachable from `inst`, innermost first. `visited` guards
+    /// against re-walking shared sub-graphs; `lowered` records unions already replaced.
+    void lowerNestedUntaggedUnions(
+        IRInst* inst,
+        HashSet<IRInst*>& lowered,
+        HashSet<IRInst*>& visited)
+    {
+        // Stay inside the type graph; any other operand kind leads out of it (in the worst case
+        // into a whole function body).
+        if (!inst || (!as<IRType>(inst) && !as<IRSetBase>(inst)))
+            return;
+
+        if (!visited.add(inst))
+            return;
+
+        for (UInt i = 0; i < inst->getOperandCount(); i++)
+            lowerNestedUntaggedUnions(inst->getOperand(i), lowered, visited);
+
+        if (auto nestedUnion = as<IRUntaggedUnionType>(inst))
+            lowerUntaggedUnionType(nestedUnion, lowered);
+    }
+
+    void lowerUntaggedUnionType(IRUntaggedUnionType* untaggedUnionType, HashSet<IRInst*>& lowered)
     {
         // `none` has no payload, so a set with one real type needs no AnyValue container. For
         // example, `UntaggedUnion({Foo, none})` can store `Foo` directly while the tagged union's
@@ -780,6 +802,21 @@ struct UntaggedUnionLoweringContext : public InstPassBase
         // any of the types in the collection.
         //
 
+        if (!lowered.add(untaggedUnionType))
+            return;
+
+        // Lower any union nested inside a member type first: the `AnyValueType` we are about to
+        // create is sized by the members' natural sizes, and a member containing a
+        // not-yet-lowered union has none and would be misreported as unpackable.
+        {
+            HashSet<IRInst*> visited;
+            for (UInt i = 0; i < untaggedUnionType->getSet()->getCount(); i++)
+                lowerNestedUntaggedUnions(
+                    untaggedUnionType->getSet()->getElement(i),
+                    lowered,
+                    visited);
+        }
+
         HashSet<IRType*> types;
         for (UInt i = 0; i < untaggedUnionType->getSet()->getCount(); i++)
         {
@@ -816,12 +853,13 @@ struct UntaggedUnionLoweringContext : public InstPassBase
 
     void processModule()
     {
+        HashSet<IRInst*> lowered;
         processInstsOfType<IRUntaggedUnionType>(
             kIROp_UntaggedUnionType,
             [&](IRUntaggedUnionType* inst)
             {
                 if (inst->hasUses())
-                    return lowerUntaggedUnionType(inst);
+                    return lowerUntaggedUnionType(inst, lowered);
             });
 
         replaceNoneTypeElementWithVoidType();

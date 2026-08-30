@@ -140,6 +140,10 @@ struct ForwardDiffTranslationContext
     //
     bool useTrivialFwdsForBwdDifferentiableFuncs = true;
 
+    // Set when the produced derivative feeds the reverse-mode pipeline, which can only split
+    // calls whose callee is backward-differentiable; other calls must stay non-differentiable.
+    bool requireBackwardDifferentiableCallees = false;
+
     ForwardDiffTranslationContext(AutoDiffSharedContext* shared, DiagnosticSink* inSink)
         : autoDiffSharedContext(shared), diffTypeContext(shared), sink(inSink)
     {
@@ -149,9 +153,7 @@ struct ForwardDiffTranslationContext
     void enableReverseModeCompatibility()
     {
         useTrivialFwdsForBwdDifferentiableFuncs = true;
-
-        // TODO: Any other flags that we need to generate a reverse-mode compatible
-        // forward-mode derivative.
+        requireBackwardDifferentiableCallees = true;
     }
 
     DiagnosticSink* getSink() { return sink; }
@@ -1372,6 +1374,20 @@ struct ForwardDiffTranslationContext
         SLANG_RELEASE_ASSERT(diffCalleeType->getParamCount() == origCall->getArgCount());
 
         auto isPointerPairMethod = checkIsPtrPairMethod(calleeType, origCall->sourceLoc);
+
+        // In reverse mode the unzip step splits every differentiated call via the callee's
+        // BackwardDerivativeApply/Remat associations. A callee that only provides a forward
+        // derivative has none, so treat the call as non-differentiable — the checker already
+        // required the caller to acknowledge the derivative loss with `no_diff`. Pointer-pair
+        // methods are exempt: they are never marked mixed-differential.
+        if (requireBackwardDifferentiableCallees && !isPointerPairMethod &&
+            !diffTypeContext.tryGetAssociationOfKind(
+                primalCallee,
+                AnnotationKind::BackwardDerivativeApply))
+        {
+            IRInst* primalCall = maybeCloneForPrimalInst(builder, origCall);
+            return InstPair(primalCall, nullptr);
+        }
 
         auto placeholderCallee = builder->getPoison(builder->getTypeKind());
         auto placeholderCall = builder->emitCallInst(nullptr, placeholderCallee, 0, nullptr);
@@ -3554,6 +3570,10 @@ IRInst* maybeTranslateRawForwardDerivativeWithAnnotations(
     IRFunc* primalFunc)
 {
     ForwardDiffTranslationContext translater(sharedContext, sink);
+
+    // This entry point is only used by the reverse-mode pipeline, so the translation must only
+    // differentiate calls the unzip/transpose steps can split.
+    translater.enableReverseModeCompatibility();
 
     IRInst* fwdDiffFunc;
     IRBuilder builder(sharedContext->moduleInst);

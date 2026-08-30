@@ -229,6 +229,12 @@ struct UnzippingContext
         auto applyBwdFunc = diffTypeContext.tryGetAssociationOfKind(
             baseFn,
             AnnotationKind::BackwardDerivativeApply);
+
+        // The forward transcriber only marks a call as mixed when its callee is
+        // backward-differentiable (see requireBackwardDifferentiableCallees), so a
+        // missing association here is a broken invariant, not valid input.
+        SLANG_RELEASE_ASSERT(applyBwdFunc);
+
         auto applyBwdFuncType = cast<IRFuncType>(
             diffTypeContext.resolveType(&globalBuilder, applyBwdFunc->getDataType()));
         applyBwdFuncType =

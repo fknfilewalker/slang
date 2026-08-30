@@ -702,8 +702,7 @@ IRInst* makeInfoForConcreteType(IRModule* module, IRInst* type, IRInst* paramTyp
     }
 
     // Non-structural or mismatched structural paramType: produce a flat UntaggedUnion.
-    return builder.getUntaggedUnionType(
-        cast<IRTypeSet>(builder.getSingletonSet(kIROp_TypeSet, type)));
+    return getUntaggedUnionTypeForSet(&builder, builder.getSingletonSet(kIROp_TypeSet, type));
 }
 
 // Determines a suitable set opcode to use to represent a set of elements of the given type.
@@ -976,10 +975,10 @@ struct TypeFlowSpecializationContext
     //
     // Typically used as the type of the value part of existential objects.
     //
-    IRUntaggedUnionType* makeUntaggedUnionType(IRTypeSet* typeSet)
+    IRType* makeUntaggedUnionType(IRTypeSet* typeSet)
     {
         IRBuilder builder(module);
-        return builder.getUntaggedUnionType(typeSet);
+        return getUntaggedUnionTypeForSet(&builder, typeSet);
     }
 
     // Make an element-of-set type out of a given set.
@@ -1154,19 +1153,259 @@ struct TypeFlowSpecializationContext
                 return makeElementOfSetType(
                     unionSet<IRSetBase>(elementOf1->getSet(), elementOf2->getSet()));
 
-        if (auto untaggedUnion1 = as<IRUntaggedUnionType>(info1))
-            if (auto untaggedUnion2 = as<IRUntaggedUnionType>(info2))
-                return makeUntaggedUnionType(unionSet<IRTypeSet>(
-                    cast<IRTypeSet>(untaggedUnion1->getSet()),
-                    cast<IRTypeSet>(untaggedUnion2->getSet())));
-
         if (as<IROptionalType>(info1) && as<IROptionalNoneType>(info2))
             return info1;
 
         if (as<IROptionalNoneType>(info1) && (as<IROptionalType>(info2)))
             return info2;
 
+        // Everything still here is type-valued: a known type `T` is just the set `{T}`, so
+        // normalize both sides to type sets and union them. `getUntaggedUnionTypeForSet` picks
+        // the canonical spelling, collapsing a singleton back to its member.
+        if (as<IRType>(info1) && as<IRType>(info2))
+        {
+            IRBuilder builder(module);
+            auto asTypeSet = [&](IRInst* info) -> IRTypeSet*
+            {
+                if (auto untaggedUnion = as<IRUntaggedUnionType>(info))
+                    return cast<IRTypeSet>(untaggedUnion->getOperand(0));
+                return cast<IRTypeSet>(builder.getSingletonSet(kIROp_TypeSet, info));
+            };
+
+            return makeUntaggedUnionType(unionSet<IRTypeSet>(asTypeSet(info1), asTypeSet(info2)));
+        }
+
         SLANG_UNEXPECTED("Incompatible propagation infos during union");
+    }
+
+    /// Return `info` with an unresolved translated type (an `IRTranslatedTypeBase` placeholder
+    /// such as `BackwardDiffIntermediateContextType(f)`) replaced by the concrete type it stands
+    /// for; any other info is returned unchanged.
+    IRInst* resolveTranslatedTypeInfo(IRInst* info)
+    {
+        if (!as<IRTranslatedTypeBase>(info))
+            return info;
+
+        if (auto resolved = translationContext.resolveInst(info))
+            return resolved;
+
+        return info;
+    }
+
+    /// Return true if `info` has the shape of a propagation info for a value declared as
+    /// `declType`: structurally identical, except that abstract positions may be refined to
+    /// their set-based composites (interface leaf → `TaggedUnionType`, witness-table leaf →
+    /// `ElementOfSetType`/`SetTagType`).
+    bool isInfoForDeclaredType(IRInst* info, IRInst* declType)
+    {
+        if (!info || !declType)
+            return false;
+
+        info = resolveTranslatedTypeInfo(info);
+        declType = resolveTranslatedTypeInfo(declType);
+
+        if (areInfosEqual(info, declType))
+            return true;
+
+        // Attributes don't affect which value can live at the location; compare the bases.
+        if (as<IRAttributedType>(declType) || as<IRAttributedType>(info))
+        {
+            return isInfoForDeclaredType(
+                unwrapAttributedType((IRType*)info),
+                unwrapAttributedType((IRType*)declType));
+        }
+
+        // Abstract leaves and their refinements.
+        if (as<IRInterfaceType>(declType))
+            return as<IRTaggedUnionType>(info) != nullptr;
+        if (as<IRWitnessTableType>(declType))
+            return as<IRElementOfSetType>(info) || as<IRSetTagType>(info);
+
+        // Structural cases: same form, all elements compatible.
+        if (auto declTuple = as<IRTupleType>(declType))
+        {
+            auto infoTuple = as<IRTupleType>(info);
+            if (!infoTuple || infoTuple->getOperandCount() != declTuple->getOperandCount())
+                return false;
+            for (UInt i = 0; i < declTuple->getOperandCount(); i++)
+            {
+                if (!isInfoForDeclaredType(infoTuple->getOperand(i), declTuple->getOperand(i)))
+                    return false;
+            }
+            return true;
+        }
+        if (auto declArray = as<IRArrayType>(declType))
+        {
+            auto infoArray = as<IRArrayType>(info);
+            return infoArray && infoArray->getElementCount() == declArray->getElementCount() &&
+                   isInfoForDeclaredType(infoArray->getElementType(), declArray->getElementType());
+        }
+        if (auto declPtr = as<IRPtrTypeBase>(declType))
+        {
+            auto infoPtr = as<IRPtrTypeBase>(info);
+            return infoPtr &&
+                   isInfoForDeclaredType(infoPtr->getValueType(), declPtr->getValueType());
+        }
+        if (auto declOptional = as<IROptionalType>(declType))
+        {
+            auto infoOptional = as<IROptionalType>(info);
+            return infoOptional && isInfoForDeclaredType(
+                                       infoOptional->getValueType(),
+                                       declOptional->getValueType());
+        }
+        if (auto declDiffPair = as<IRDifferentialPairType>(declType))
+        {
+            // A differential pair's info is kept as a two-element tuple (see
+            // `unionPropagationInfo`), with both halves masked by the pair's value type.
+            auto infoTuple = as<IRTupleType>(info);
+            if (!infoTuple || infoTuple->getOperandCount() != 2)
+                return false;
+            return isInfoForDeclaredType(infoTuple->getOperand(0), declDiffPair->getValueType()) &&
+                   isInfoForDeclaredType(infoTuple->getOperand(1), declDiffPair->getValueType());
+        }
+
+        return false;
+    }
+
+    /// Return `type` with every raw interface leaf refined to the tagged union over the
+    /// interface's registered conformances, recursing through structural forms; positions that
+    /// already carry set-based infos, or that no conformance can refine, are left unchanged.
+    /// This mirrors what `seedGlobalScope` does for a bare interface-typed global: the widest
+    /// sound refinement for a raw interface is the set of registered conformances, and the
+    /// extract-existential analyses need that set to specialize against.
+    IRInst* refineAbstractLeavesToInfo(IRInst* type)
+    {
+        if (auto interfaceType = as<IRInterfaceType>(type))
+        {
+            if (isComInterfaceType(interfaceType))
+                return type;
+            IRBuilder builder(module);
+            HashSet<IRInst*>& tables = *module->getContainerPool().getHashSet<IRInst>();
+            collectExistentialTables(interfaceType, tables);
+            IRInst* result = type;
+            if (tables.getCount() > 0)
+            {
+                result = makeTaggedUnionType(
+                    as<IRWitnessTableSet>(builder.getSet(kIROp_WitnessTableSet, tables)));
+            }
+            module->getContainerPool().free(&tables);
+            return result;
+        }
+
+        if (auto tupleType = as<IRTupleType>(type))
+        {
+            IRBuilder builder(module);
+            List<IRType*> elements;
+            bool anyChanged = false;
+            for (UInt i = 0; i < tupleType->getOperandCount(); i++)
+            {
+                auto element = refineAbstractLeavesToInfo(tupleType->getOperand(i));
+                anyChanged |= (element != tupleType->getOperand(i));
+                elements.add((IRType*)element);
+            }
+            return anyChanged ? builder.getTupleType(elements) : type;
+        }
+        if (auto arrayType = as<IRArrayType>(type))
+        {
+            auto element = refineAbstractLeavesToInfo(arrayType->getElementType());
+            if (element == arrayType->getElementType())
+                return type;
+            IRBuilder builder(module);
+            return builder.getArrayType(
+                (IRType*)element,
+                arrayType->getElementCount(),
+                getArrayStride(arrayType));
+        }
+        if (auto ptrType = as<IRPtrTypeBase>(type))
+        {
+            auto valueType = refineAbstractLeavesToInfo(ptrType->getValueType());
+            if (valueType == ptrType->getValueType())
+                return type;
+            IRBuilder builder(module);
+            return builder.getPtrTypeWithAddressSpace((IRType*)valueType, ptrType);
+        }
+
+        return type;
+    }
+
+    /// Intersect a propagation info with the declared type of the location it flows into,
+    /// returning the narrowed info, or `info` unchanged when nothing narrows. An info can
+    /// over-approximate when the value flowed through a location shared between several types;
+    /// at a location declared with one specific type, only the compatible members can actually
+    /// arrive, and keeping just those restores the structural info the consumer needs.
+    IRInst* maybeNarrowInfoToDeclaredType(IRInst* info, IRInst* declType)
+    {
+        if (!info || !declType)
+            return info;
+
+        declType = resolveTranslatedTypeInfo(declType);
+
+        // The interesting case: a boxed union meeting a declared type that pins down the shape.
+        // Keep only the members that could be an info for the declared type.
+        if (auto unionInfo = as<IRUntaggedUnionType>(info))
+        {
+            IRInst* narrowed = nullptr;
+            bool droppedAny = false;
+            forEachInSet(
+                module,
+                unionInfo->getSet(),
+                [&](IRInst* member)
+                {
+                    if (isInfoForDeclaredType(member, declType))
+                    {
+                        // A member drawn from declared types leaves nested existential fields as
+                        // raw interface types; give them the conformance-set refinement their
+                        // consumers specialize against.
+                        auto memberInfo = refineAbstractLeavesToInfo(member);
+                        narrowed = narrowed ? unionPropagationInfo(declType, narrowed, memberInfo)
+                                            : memberInfo;
+                    }
+                    else
+                        droppedAny = true;
+                });
+            // Narrow only when the declared type actually discriminated: if every member fits
+            // (or none does — the declared type doesn't describe this box at all, e.g. it is
+            // itself an unresolved lookup), the union stands as-is.
+            if (narrowed && droppedAny)
+                return narrowed;
+            return info;
+        }
+
+        // Structural declared types narrow element-wise, rebuilding only if a child changed.
+        if (auto declTuple = as<IRTupleType>(declType))
+        {
+            auto infoTuple = as<IRTupleType>(info);
+            if (!infoTuple || infoTuple->getOperandCount() != declTuple->getOperandCount())
+                return info;
+            IRBuilder builder(module);
+            List<IRType*> elements;
+            bool anyChanged = false;
+            for (UInt i = 0; i < declTuple->getOperandCount(); i++)
+            {
+                auto element = maybeNarrowInfoToDeclaredType(
+                    infoTuple->getOperand(i),
+                    declTuple->getOperand(i));
+                anyChanged |= (element != infoTuple->getOperand(i));
+                elements.add((IRType*)element);
+            }
+            return anyChanged ? builder.getTupleType(elements) : info;
+        }
+        if (auto declPtr = as<IRPtrTypeBase>(declType))
+        {
+            auto infoPtr = as<IRPtrTypeBase>(info);
+            if (!infoPtr)
+                return info;
+            auto valueInfo =
+                maybeNarrowInfoToDeclaredType(infoPtr->getValueType(), declPtr->getValueType());
+            if (valueInfo == infoPtr->getValueType())
+                return info;
+            IRBuilder builder(module);
+            return builder.getPtrTypeWithAddressSpace((IRType*)valueInfo, infoPtr);
+        }
+        if (auto declAttributed = as<IRAttributedType>(declType))
+            return maybeNarrowInfoToDeclaredType(info, declAttributed->getBaseType());
+
+        return info;
     }
 
     // Union-mask-aware union of two propagation infos using a three-input structural approach.
@@ -1191,6 +1430,7 @@ struct TypeFlowSpecializationContext
             return info2;
         if (!info2)
             return info1;
+
         if (areInfosEqual(info1, info2))
             return info1;
 
@@ -1208,17 +1448,22 @@ struct TypeFlowSpecializationContext
         {
             auto tuple1 = as<IRTupleType>(info1);
             auto tuple2 = as<IRTupleType>(info2);
-
-            IRBuilder builder(module);
-            List<IRType*> elementInfos;
-            for (UInt i = 0; i < tupleUnionMask->getOperandCount(); i++)
+            // Decompose only when both infos really are tuple-shaped; a merge point of tuple
+            // type can still receive a flat info (e.g. an `UntaggedUnionType`), which falls
+            // through to the structural-match-failed handling below.
+            if (tuple1 && tuple2)
             {
-                elementInfos.add((IRType*)unionPropagationInfo(
-                    tupleUnionMask->getOperand(i),
-                    tuple1->getOperand(i),
-                    tuple2->getOperand(i)));
+                IRBuilder builder(module);
+                List<IRType*> elementInfos;
+                for (UInt i = 0; i < tupleUnionMask->getOperandCount(); i++)
+                {
+                    elementInfos.add((IRType*)unionPropagationInfo(
+                        tupleUnionMask->getOperand(i),
+                        tuple1->getOperand(i),
+                        tuple2->getOperand(i)));
+                }
+                return builder.getTupleType(elementInfos);
             }
-            return builder.getTupleType(elementInfos);
         }
 
         // Array
@@ -1373,6 +1618,10 @@ struct TypeFlowSpecializationContext
     {
         if (isConcreteType(inst->getDataType()))
             return;
+
+        // Intersect with the declared type first so the union below only joins what can
+        // actually arrive here (see `maybeNarrowInfoToDeclaredType`).
+        newInfo = maybeNarrowInfoToDeclaredType(newInfo, mergePointType);
 
         auto existingInfo = tryGetInfo(context, inst);
         auto unionedInfo = unionPropagationInfo(mergePointType, existingInfo, newInfo);
@@ -3629,6 +3878,11 @@ struct TypeFlowSpecializationContext
             return none();
         }
 
+        // See analyzeExtractExistentialType: refine a bare interface-typed info to the
+        // tagged union over the registered conformances before dispatching on its shape.
+        if (as<IRInterfaceType>(operandInfo))
+            operandInfo = refineAbstractLeavesToInfo(operandInfo);
+
         if (auto taggedUnion = as<IRTaggedUnionType>(operandInfo))
         {
             auto tableSet = taggedUnion->getWitnessTableSet();
@@ -3680,6 +3934,11 @@ struct TypeFlowSpecializationContext
             return none();
         }
 
+        // Narrowing can leave an existential's info as a bare interface type; refine it to the
+        // tagged union over the registered conformances before dispatching on its shape.
+        if (as<IRInterfaceType>(operandInfo))
+            operandInfo = refineAbstractLeavesToInfo(operandInfo);
+
         if (auto taggedUnion = as<IRTaggedUnionType>(operandInfo))
             return makeElementOfSetType(taggedUnion->getTypeSet());
 
@@ -3715,6 +3974,11 @@ struct TypeFlowSpecializationContext
                 diagnoseEntryPointInterfaceParamIfNeeded(param, inst);
             return none();
         }
+
+        // See analyzeExtractExistentialType: refine a bare interface-typed info to the
+        // tagged union over the registered conformances before dispatching on its shape.
+        if (as<IRInterfaceType>(operandInfo))
+            operandInfo = refineAbstractLeavesToInfo(operandInfo);
 
         if (auto taggedUnion = as<IRTaggedUnionType>(operandInfo))
             return makeUntaggedUnionType(taggedUnion->getTypeSet());
@@ -5663,13 +5927,8 @@ struct TypeFlowSpecializationContext
 
         if (auto valOfSetType = as<IRUntaggedUnionType>(info))
         {
-            if (valOfSetType->getSet()->isSingleton())
-            {
-                // If there's only one type in the set, return it directly
-                return (IRType*)valOfSetType->getSet()->getElement(0);
-            }
-
-            return valOfSetType;
+            IRBuilder builder(module);
+            return getUntaggedUnionTypeForSet(&builder, valOfSetType->getSet());
         }
 
         if (as<IRFuncSet>(info) || as<IRWitnessTableSet>(info))
@@ -7195,9 +7454,7 @@ struct TypeFlowSpecializationContext
         }
 
         // Create the appropriate any-value type
-        auto effectiveType = typeSet->isSingleton()
-                                 ? (IRType*)typeSet->getElement(0)
-                                 : builder.getUntaggedUnionType((IRType*)typeSet);
+        auto effectiveType = getUntaggedUnionTypeForSet(&builder, typeSet);
 
         // Pack the value
         auto packedValue = as<IRUntaggedUnionType>(effectiveType)
@@ -7308,18 +7565,14 @@ struct TypeFlowSpecializationContext
             args);
 
         IRInst* packedValue = nullptr;
-        auto set = taggedUnionType->getTypeSet();
-        if (!set->isSingleton())
+        auto valuePartType = getUntaggedUnionTypeForSet(&builder, taggedUnionType->getTypeSet());
+        if (as<IRUntaggedUnionType>(valuePartType))
         {
-            packedValue = builder.emitPackAnyValue(
-                (IRType*)builder.getUntaggedUnionType(set),
-                inst->getValue());
+            packedValue = builder.emitPackAnyValue(valuePartType, inst->getValue());
         }
         else
         {
-            packedValue = builder.emitReinterpret(
-                (IRType*)builder.getUntaggedUnionType(set),
-                inst->getValue());
+            packedValue = builder.emitReinterpret(valuePartType, inst->getValue());
         }
 
         auto newInst = builder.emitMakeTaggedUnion(
@@ -7517,7 +7770,7 @@ struct TypeFlowSpecializationContext
                 else if (auto typeSet = as<IRTypeSet>(setTagType->getSet()))
                 {
                     IRBuilder builder(inst);
-                    args.add(builder.getUntaggedUnionType(typeSet));
+                    args.add(getUntaggedUnionTypeForSet(&builder, typeSet));
                 }
             }
             else

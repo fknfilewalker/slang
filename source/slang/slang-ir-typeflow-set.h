@@ -24,6 +24,13 @@ void forEachInSet(IRModule* module, IRSetBase* info, F func)
     module->getContainerPool().free(&elements);
 }
 
+/// Return the type for a value whose concrete type is one of the members of `typeSet`: the
+/// member itself for a singleton set, otherwise an `UntaggedUnionType` over the set. Every site
+/// that materializes such a type must use this function so a singleton has one canonical
+/// spelling; otherwise `UntaggedUnionType(TypeSet{T})` and `T` coexist, passes legalize toward
+/// different spellings, and the type-flow fixpoint never converges.
+IRType* getUntaggedUnionTypeForSet(IRBuilder* builder, IRInst* typeSet);
+
 // Upcast the value in 'arg' to match the destInfo type. This method inserts
 // any necessary reinterprets or tag translation instructions.
 //
