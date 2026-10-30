@@ -27,6 +27,16 @@ Expr* parseTermFromSourceFile(
 
 struct SemanticsVisitor;
 
+class UnparsedExpr;
+
+/// Parse an `UnparsedExpr` again, deciding each `<` with `semantics`.
+Expr* parseUnparsedExpr(
+    ASTBuilder* astBuilder,
+    SemanticsVisitor* semantics,
+    TranslationUnitRequest* translationUnit,
+    UnparsedExpr* unparsedExpr,
+    DiagnosticSink* sink);
+
 Stmt* parseUnparsedStmt(
     ASTBuilder* astBuilder,
     SemanticsVisitor* semantics,

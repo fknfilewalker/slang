@@ -22,6 +22,7 @@
 #include "slang-ast-synthesis.h"
 #include "slang-lookup-spirv.h"
 #include "slang-lookup.h"
+#include "slang-parser.h"
 #include "slang-rich-diagnostics.h"
 
 namespace Slang
@@ -3767,6 +3768,18 @@ Expr* SemanticsExprVisitor::visitParenExpr(ParenExpr* expr)
     expr->base = base;
     expr->type = base->type;
     return expr;
+}
+
+Expr* SemanticsExprVisitor::visitUnparsedExpr(UnparsedExpr* expr)
+{
+    // Parse the tokens again, now deciding each `<` by what precedes it (see `UnparsedExpr`).
+    auto parsedExpr = parseUnparsedExpr(
+        m_astBuilder,
+        this,
+        getShared()->getTranslationUnitRequest(),
+        expr,
+        getSink());
+    return CheckTerm(parsedExpr);
 }
 
 Expr* SemanticsExprVisitor::visitTupleExpr(TupleExpr* expr)

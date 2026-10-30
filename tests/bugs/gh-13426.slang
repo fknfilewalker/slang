@@ -5,10 +5,10 @@
 // A `<` after a value that does not check to a DeclRefExpr (a swizzle, a tuple
 // element, a member reached through a temporary) must parse as less-than, even when
 // a later `>` is followed by `(`. The file also guards two details of the fix:
-// - rows 8-9 (`p->y`, `p->x`): the checked base is reused, so the `DerefMemberExpr`
-//   is not checked a second time (which reported a false "cannot dereference");
-// - row 18 (`h.o.get<4>()`): a base of unknown kind is not reused, because generic
-//   application rejects the `LetExpr` it checks to.
+// - rows 8-9 (`p->y`, `p->x`): the lookahead checks a copy, so the `DerefMemberExpr`
+//   itself is checked only once (checking it twice reported a false "cannot dereference");
+// - row 18 (`h.o.get<4>()`): the copy checks to `LetExpr` bindings because `o` is an
+//   interface; the member inside them decides that `<` starts generic arguments.
 //
 // Inputs: uv = (0.25, 0.75), x = 0.75, a = 0.5 lies between uv.x and uv.y, and b = 0.75
 // equals uv.y and x, so a strict comparison of those against b never holds.

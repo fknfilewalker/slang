@@ -1095,6 +1095,13 @@ err(
 )
 
 err(
+    "guessed-generic-arguments-changed-extent",
+    20023,
+    "ambiguous '<' outside a function body",
+    span { loc = "location", message = "this expression was read as generic arguments when the declaration was parsed, which made it extend too far; put parentheses around the comparison" }
+)
+
+err(
     "invalid-spirv-version",
     20012,
     "invalid SPIR-V version",

@@ -4387,6 +4387,7 @@ public:
     Expr* visitIndexExpr(IndexExpr* subscriptExpr);
 
     Expr* visitParenExpr(ParenExpr* expr);
+    Expr* visitUnparsedExpr(UnparsedExpr* expr);
 
     Expr* visitTupleExpr(TupleExpr* expr);
 

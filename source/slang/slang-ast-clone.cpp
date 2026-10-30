@@ -110,15 +110,51 @@ void ASTCloner::cloneNodeFields(NodeBase* dst, NodeBase* src)
             ASTCloneFieldAccess::cloneFields(*this, static_cast<T*>(dst), typedSrc);
         });
 
-    if (auto srcStaticMemberExpr = as<StaticMemberExpr>(src))
+    cloneUnreflectedFields(dst, src);
+}
+
+// FIDDLE does not reflect some syntax fields, such as names, lookup scopes, literal tokens and
+// source locations. Copy them too, so a clone can be checked again like its source. A syntax
+// field added to an expression without FIDDLE needs to be copied here as well.
+void ASTCloner::cloneUnreflectedFields(NodeBase* dst, NodeBase* src)
+{
+    if (auto s = as<DeclRefExpr>(src))
     {
-        // These fields are not reflected through FIDDLE, so the generated clone above cannot see
-        // them. Preserve the lookup base because cloned generic-constraint type syntax may need it
-        // if the type expression is checked again.
-        auto dstStaticMemberExpr = as<StaticMemberExpr>(dst);
-        dstStaticMemberExpr->baseExpression = cloneExpr(srcStaticMemberExpr->baseExpression);
-        dstStaticMemberExpr->memberOperatorLoc = srcStaticMemberExpr->memberOperatorLoc;
+        auto d = as<DeclRefExpr>(dst);
+        d->name = s->name;
+        d->scope = s->scope;
     }
+    if (auto s = as<StaticMemberExpr>(src))
+    {
+        auto d = as<StaticMemberExpr>(dst);
+        d->baseExpression = cloneExpr(s->baseExpression);
+        d->memberOperatorLoc = s->memberOperatorLoc;
+    }
+    if (auto s = as<MemberExpr>(src))
+        as<MemberExpr>(dst)->memberOperatorLoc = s->memberOperatorLoc;
+    if (auto s = as<LiteralExpr>(src))
+        as<LiteralExpr>(dst)->token = s->token;
+    if (auto s = as<InitializerListExpr>(src))
+        as<InitializerListExpr>(dst)->useCStyleInitialization = s->useCStyleInitialization;
+    if (auto s = as<AppExprBase>(src))
+        as<AppExprBase>(dst)->argumentDelimeterLocs = s->argumentDelimeterLocs;
+    if (auto s = as<IndexExpr>(src))
+        as<IndexExpr>(dst)->argumentDelimeterLocs = s->argumentDelimeterLocs;
+    if (auto s = as<TupleExpr>(src))
+    {
+        for (auto element : s->elements)
+            as<TupleExpr>(dst)->elements.add(cloneExpr(element));
+    }
+    if (auto s = as<ThisExpr>(src))
+        as<ThisExpr>(dst)->scope = s->scope;
+    if (auto s = as<ThisTypeExpr>(src))
+        as<ThisTypeExpr>(dst)->scope = s->scope;
+    if (auto s = as<ReturnValExpr>(src))
+        as<ReturnValExpr>(dst)->scope = s->scope;
+    if (auto s = as<TryExpr>(src))
+        as<TryExpr>(dst)->scope = s->scope;
+    if (auto s = as<TreatAsDifferentiableExpr>(src))
+        as<TreatAsDifferentiableExpr>(dst)->scope = s->scope;
 }
 
 Decl* ASTCloner::cloneDecl(Decl* decl)

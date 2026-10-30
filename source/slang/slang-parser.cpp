@@ -2,6 +2,7 @@
 
 #include "core/slang-semantic-version.h"
 #include "core/slang-string-util.h"
+#include "slang-ast-clone.h"
 #include "slang-ast-decl.h"
 #include "slang-check-impl.h"
 #include "slang-compiler.h"
@@ -131,6 +132,9 @@ public:
 
     Scope* outerScope = nullptr;
     Scope* currentLookupScope = nullptr; // Scope where expr lookup should initiate from.
+
+    // Set when a `<` was guessed to start generic arguments or not (see `tryParseGenericApp`).
+    bool guessedGenericApp = false;
     Scope* currentScope = nullptr; // Scope where new decl definitions should be inserted into.
     ModuleDecl* currentModule = nullptr;
 
@@ -141,7 +145,8 @@ public:
     SourceLoc lastErrorLoc;
     ParserOptions options;
     Modifiers* pendingModifiers = nullptr;
-    int genericDepth = 0;
+    // First token inside the innermost generic argument or parameter list, or null outside one.
+    const Token* genericListBegin = nullptr;
 
     // Is the parser in a "recovering" state?
     // During recovery we don't emit additional errors, until we find
@@ -272,7 +277,7 @@ public:
 
     // Parse an expression that might be used in an initializer or argument context, so we should
     // avoid operator-comma
-    inline Expr* ParseInitExpr() { return ParseExpression(Precedence::Assignment); }
+    Expr* ParseInitExpr();
     inline Expr* ParseArgExpr() { return ParseExpression(Precedence::Assignment); }
 
     Expr* ParseLeafExpression();
@@ -315,6 +320,20 @@ public:
             lastErrorLoc = loc;
         }
     }
+};
+
+// Marks the tokens from the current one on as the innermost generic list until destroyed.
+struct GenericListScope
+{
+    GenericListScope(Parser* parser)
+        : m_parser(parser), m_outerListBegin(parser->genericListBegin)
+    {
+        parser->genericListBegin = parser->tokenReader.m_cursor;
+    }
+    ~GenericListScope() { m_parser->genericListBegin = m_outerListBegin; }
+
+    Parser* m_parser;
+    const Token* m_outerListBegin;
 };
 
 // Forward Declarations
@@ -1816,37 +1835,38 @@ template<typename TFunc>
 static void ParseGenericDeclImpl(Parser* parser, GenericDecl* decl, const TFunc& parseInnerFunc)
 {
     parser->ReadToken(TokenType::OpLess);
-    parser->genericDepth++;
-    for (;;)
     {
-        const TokenType tokenType = parser->tokenReader.peekTokenType();
-        if (tokenType == TokenType::OpGreater || tokenType == TokenType::EndOfFile)
+        GenericListScope genericList(parser);
+        for (;;)
         {
-            break;
+            const TokenType tokenType = parser->tokenReader.peekTokenType();
+            if (tokenType == TokenType::OpGreater || tokenType == TokenType::EndOfFile)
+            {
+                break;
+            }
+
+            auto currentCursor = parser->tokenReader.getCursor();
+
+            auto genericParam = ParseGenericParamDecl(parser, decl);
+            // A generic parameter named with a type keyword (e.g. `<int struct>` or
+            // `<struct>`) is just as unreferenceable as any other such name, and the
+            // several `ParseGenericParamDecl` exits read the name directly without
+            // reaching the other hook sites, so warn here at the single shared point.
+            if (genericParam)
+                maybeDiagnoseKeywordUsedAsName(parser, genericParam->nameAndLoc);
+            AddMember(decl, genericParam);
+
+            // Make sure we make forward progress.
+            if (parser->tokenReader.getCursor() == currentCursor)
+                advanceToken(parser);
+
+            if (parser->LookAheadToken(TokenType::OpGreater))
+                break;
+
+            if (!AdvanceIf(parser, TokenType::Comma))
+                break;
         }
-
-        auto currentCursor = parser->tokenReader.getCursor();
-
-        auto genericParam = ParseGenericParamDecl(parser, decl);
-        // A generic parameter named with a type keyword (e.g. `<int struct>` or
-        // `<struct>`) is just as unreferenceable as any other such name, and the
-        // several `ParseGenericParamDecl` exits read the name directly without
-        // reaching the other hook sites, so warn here at the single shared point.
-        if (genericParam)
-            maybeDiagnoseKeywordUsedAsName(parser, genericParam->nameAndLoc);
-        AddMember(decl, genericParam);
-
-        // Make sure we make forward progress.
-        if (parser->tokenReader.getCursor() == currentCursor)
-            advanceToken(parser);
-
-        if (parser->LookAheadToken(TokenType::OpGreater))
-            break;
-
-        if (!AdvanceIf(parser, TokenType::Comma))
-            break;
     }
-    parser->genericDepth--;
     parser->ReadToken(TokenType::OpGreater);
     decl->inner = parseInnerFunc(decl);
     decl->inner->parentDecl = decl;
@@ -3020,7 +3040,7 @@ static Expr* parseGenericApp(Parser* parser, Expr* base)
     genericApp->functionExpr = base;
     auto opLess = parser->ReadToken(TokenType::OpLess);
     genericApp->argumentDelimeterLocs.add(opLess.loc);
-    parser->genericDepth++;
+    GenericListScope genericList(parser);
 
     for (;;)
     {
@@ -3039,7 +3059,6 @@ static Expr* parseGenericApp(Parser* parser, Expr* base)
         }
     }
     genericApp->argumentDelimeterLocs.add(parser->tokenReader.peekLoc());
-    parser->genericDepth--;
 
     if (parser->tokenReader.peekToken().type == TokenType::OpRsh)
     {
@@ -3084,8 +3103,22 @@ static Expr* tryParseGenericApp(Parser* parser, Expr* base)
     {
         // If we have access to a semantic visitor, we can check the base
         // and see if it refers to a generic.
-        auto checkedBase = parser->semanticsVisitor->CheckTerm(base);
-        if (auto declRefExpr = as<DeclRefExpr>(checkedBase))
+        //
+        // Checking modifies the nodes it visits and may add temporaries, so we check a copy and
+        // keep `base` untouched; it is checked once, normally, as part of the full expression.
+        // Diagnostics go to a throwaway sink so they are not reported twice.
+        ASTCloner cloner(parser->astBuilder);
+        DiagnosticSink lookaheadSink(parser->sink->getSourceManager(), nullptr);
+        SemanticsVisitor lookaheadVisitor(parser->semanticsVisitor->withSink(&lookaheadSink));
+        auto checkedBase = lookaheadVisitor.CheckTerm(cloner.cloneExpr(base));
+
+        // Temporaries (e.g. for `obj` in `obj.f` with interface type) come back as `LetExpr`
+        // bindings around the checked term. Look inside them to classify the term itself.
+        Expr* checkedTerm = checkedBase;
+        while (auto letExpr = as<LetExpr>(checkedTerm))
+            checkedTerm = letExpr->body;
+
+        if (auto declRefExpr = as<DeclRefExpr>(checkedTerm))
         {
             if (declRefExpr->declRef.is<GenericDecl>())
             {
@@ -3108,7 +3141,7 @@ static Expr* tryParseGenericApp(Parser* parser, Expr* base)
                 baseKind = BaseGenericKind::NonGeneric;
             }
         }
-        else if (auto overloadedExpr = as<OverloadedExpr>(checkedBase))
+        else if (auto overloadedExpr = as<OverloadedExpr>(checkedTerm))
         {
             baseKind = BaseGenericKind::NonGeneric;
             for (auto candidate : overloadedExpr->lookupResult2)
@@ -3122,25 +3155,13 @@ static Expr* tryParseGenericApp(Parser* parser, Expr* base)
                 }
             }
         }
-        else if (as<DeclRefType>(checkedBase->type.type))
+        else if (as<DeclRefType>(checkedTerm->type.type))
         {
             // An expression whose checked type is a `DeclRefType` is a value, such as a swizzle
             // (`uv.y`) or tuple element (`t._0`), and a value takes no generic arguments. An
             // expression that names a type, namespace, function, generic or overload set has a
-            // kind-like type that is not a `DeclRefType`, and a wrapper such as the `LetExpr`
-            // that `_CheckTerm` adds for temporaries takes the type of its body.
+            // kind-like type that is not a `DeclRefType`.
             baseKind = BaseGenericKind::NonGeneric;
-        }
-
-        // Checking a `MemberExpr` stores its dereferenced or opened base back into the node,
-        // so checking the unchecked node again can apply `->` to a non-pointer (`p->y` with
-        // `float2* p` would report that `vector<float,2>` cannot be dereferenced). We reuse the
-        // checked node once the kind is decided: `Generic` is only set for a `DeclRefExpr` or
-        // `OverloadedExpr`, which `AddGenericOverloadCandidates` accepts, while an `Unknown`
-        // node may be a `LetExpr` that it rejects, as in `h.o.get<4>()` with an interface `o`.
-        if (as<MemberExpr>(base) && baseKind != BaseGenericKind::Unknown)
-        {
-            base = checkedBase;
         }
     }
     else
@@ -3163,6 +3184,7 @@ static Expr* tryParseGenericApp(Parser* parser, Expr* base)
         return base;
 
     // otherwise, we speculate as generics, and fallback to comparison when parsing failed
+    parser->guessedGenericApp = true;
     TokenSpan tokenSpan;
     tokenSpan.m_begin = parser->tokenReader.m_cursor;
     tokenSpan.m_end = parser->tokenReader.m_end;
@@ -6495,11 +6517,9 @@ static void parseInterfaceDefaultCallableAsExplicitGeneric(
     AddMember(genericDecl, thisTypeConstraint);
 
     parser->FillPosition(genericDecl);
-    parser->genericDepth++;
     auto newInnerDecl = as<Decl>(ParseDecl(parser, genericDecl));
     genericDecl->inner = newInnerDecl;
     newInnerDecl->parentDecl = genericDecl;
-    parser->genericDepth--;
     parser->PopScope();
     AddMember(interfaceDecl, genericDecl);
 
@@ -8157,6 +8177,34 @@ Associativity GetAssociativityFromLevel(Precedence level)
         return Associativity::Left;
 }
 
+// A `>` at the cursor closes the innermost generic list, unless a bracket opened inside that list
+// is still open: in `k<(a > b)>()` the first `>` is an operator.
+static bool isAtGenericListEnd(Parser* parser)
+{
+    if (!parser->genericListBegin)
+        return false;
+    int openBrackets = 0;
+    for (auto token = parser->genericListBegin; token < parser->tokenReader.m_cursor; token++)
+    {
+        switch (token->type)
+        {
+        case TokenType::LParent:
+        case TokenType::LBracket:
+        case TokenType::LBrace:
+            openBrackets++;
+            break;
+        case TokenType::RParent:
+        case TokenType::RBracket:
+        case TokenType::RBrace:
+            openBrackets--;
+            break;
+        default:
+            break;
+        }
+    }
+    return openBrackets <= 0;
+}
+
 Precedence GetOpLevel(Parser* parser, const Token& token)
 {
     switch (token.type)
@@ -8192,16 +8240,16 @@ Precedence GetOpLevel(Parser* parser, const Token& token)
         return Precedence::EqualityComparison;
     case TokenType::OpGreater:
     case TokenType::OpGeq:
-        // Don't allow these ops inside a generic argument
-        if (parser->genericDepth > 0)
+        // Don't allow these ops where they would end a generic list
+        if (isAtGenericListEnd(parser))
             return Precedence::Invalid;
         ; // fall-thru
     case TokenType::OpLeq:
     case TokenType::OpLess:
         return Precedence::RelationalComparison;
     case TokenType::OpRsh:
-        // Don't allow this op inside a generic argument
-        if (parser->genericDepth > 0)
+        // Don't allow this op where it would end a generic list
+        if (isAtGenericListEnd(parser))
             return Precedence::Invalid;
         ; // fall-thru
     case TokenType::OpLsh:
@@ -10352,6 +10400,73 @@ Expr* parseTermFromSourceFile(
     parser.currentScope = outerScope;
     parser.namePool = namePool;
     return parser.ParseExpression();
+}
+
+Expr* Parser::ParseInitExpr()
+{
+    if (getStage() != ParsingStage::Decl)
+        return ParseExpression(Precedence::Assignment);
+
+    // Outside function bodies a `<` can only be guessed. If this expression has such a guess,
+    // keep its tokens so checking can parse it again (see `UnparsedExpr`). An expression with
+    // syntax errors is kept as is, so the errors are not reported twice.
+    auto begin = tokenReader.m_cursor;
+    auto errorCount = sink->getErrorCount();
+    bool outerGuessed = guessedGenericApp;
+    guessedGenericApp = false;
+    auto expr = ParseExpression(Precedence::Assignment);
+    bool guessed = guessedGenericApp;
+    guessedGenericApp = outerGuessed || guessed;
+    if (!guessed || !expr || sink->getErrorCount() != errorCount)
+        return expr;
+
+    auto unparsedExpr = astBuilder->create<UnparsedExpr>();
+    unparsedExpr->loc = expr->loc;
+    unparsedExpr->currentScope = currentScope;
+    unparsedExpr->outerScope = outerScope;
+    unparsedExpr->sourceLanguage = getSourceLanguage();
+    for (auto token = begin; token != tokenReader.m_cursor; token++)
+        unparsedExpr->tokens.add(*token);
+    Token eofToken;
+    eofToken.type = TokenType::EndOfFile;
+    eofToken.loc = tokenReader.peekLoc();
+    unparsedExpr->tokens.add(eofToken);
+    return unparsedExpr;
+}
+
+Expr* parseUnparsedExpr(
+    ASTBuilder* astBuilder,
+    SemanticsVisitor* semanticsVisitor,
+    TranslationUnitRequest* translationUnit,
+    UnparsedExpr* unparsedExpr,
+    DiagnosticSink* sink)
+{
+    ParserOptions options = {};
+    options.stage = ParsingStage::Body;
+    options.enableEffectAnnotations = translationUnit->compileRequest->optionSet.getBoolOption(
+        CompilerOptionName::EnableEffectAnnotations);
+    options.sourceLanguage = unparsedExpr->sourceLanguage;
+    options.isInLanguageServer =
+        translationUnit->compileRequest->getLinkage()->isInLanguageServer();
+    options.isCoreModule = translationUnit->compileRequest->m_isCoreModuleCode;
+    options.optionSet = translationUnit->compileRequest->optionSet;
+
+    TokenList tokens;
+    tokens.m_tokens = unparsedExpr->tokens;
+    Parser parser(astBuilder, tokens, sink, unparsedExpr->outerScope, options);
+    parser.namePool = translationUnit->getNamePool();
+    parser.semanticsVisitor = semanticsVisitor;
+    parser.currentScope = parser.currentLookupScope = unparsedExpr->currentScope;
+    parser.currentModule = semanticsVisitor->getShared()->getModule()->getModuleDecl();
+    auto expr = parser.ParseInitExpr();
+
+    // The tokens are the extent of the first parse, which guessed. If the expression now ends
+    // earlier, that guess also decided what the rest belongs to (`x = a < b, y = c > (d)` took
+    // `y` into `x`), and only the declaration can be parsed differently, so report it.
+    if (!parser.LookAheadToken(TokenType::EndOfFile))
+        sink->diagnose(Diagnostics::GuessedGenericArgumentsChangedExtent{
+            .location = parser.tokenReader.peekLoc()});
+    return expr;
 }
 
 Stmt* parseUnparsedStmt(

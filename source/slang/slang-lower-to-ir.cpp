@@ -5585,6 +5585,12 @@ struct ExprLoweringVisitorBase : public ExprVisitor<Derived, LoweredValInfo>
         UNREACHABLE_RETURN(LoweredValInfo());
     }
 
+    LoweredValInfo visitUnparsedExpr(UnparsedExpr* /*expr*/)
+    {
+        SLANG_UNEXPECTED("unparsed expressions should not occur in checked AST");
+        UNREACHABLE_RETURN(LoweredValInfo());
+    }
+
     LoweredValInfo visitLambdaExpr(LambdaExpr*)
     {
         SLANG_UNEXPECTED("a valid ast should not contain an LambdaExpr.");

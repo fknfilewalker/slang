@@ -176,6 +176,7 @@ public:
 private:
     NodeBase* cloneSyntaxNode(NodeBase* node);
     void cloneNodeFields(NodeBase* dst, NodeBase* src);
+    void cloneUnreflectedFields(NodeBase* dst, NodeBase* src);
     Decl* rewriteDecl(Decl* decl);
     Val* rewriteValImpl(Val* val);
 

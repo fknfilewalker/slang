@@ -45,6 +45,19 @@ class VarExpr : public DeclRefExpr
     FIDDLE(...)
 };
 
+// An expression outside a function body in which the parser had to guess whether a `<` starts
+// generic arguments, because there is no semantic information yet. Checking parses the tokens
+// again, now able to decide each `<` by what the expression before it refers to.
+FIDDLE()
+class UnparsedExpr : public Expr
+{
+    FIDDLE(...)
+    List<Token> tokens;
+    Scope* currentScope = nullptr;
+    Scope* outerScope = nullptr;
+    SourceLanguage sourceLanguage;
+};
+
 FIDDLE()
 class DefaultConstructExpr : public Expr
 {
