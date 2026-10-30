@@ -7,8 +7,8 @@
 // a later `>` is followed by `(`. The file also guards two details of the fix:
 // - rows 8-9 (`p->y`, `p->x`): the checked base is reused, so the `DerefMemberExpr`
 //   is not checked a second time (which reported a false "cannot dereference");
-// - row 18 (`h.o.get<4>()`): a base of unknown kind is not reused, because generic
-//   application rejects the `LetExpr` it checks to.
+// - row 18 (`h.o.get<4>()`): the base is wrapped in `LetExpr` bindings because `o` is
+//   an interface; it is reused too, and the bindings move to the enclosing scope.
 //
 // Inputs: uv = (0.25, 0.75), x = 0.75, a = 0.5 lies between uv.x and uv.y, and b = 0.75
 // equals uv.y and x, so a strict comparison of those against b never holds.

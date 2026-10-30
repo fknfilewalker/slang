@@ -3085,7 +3085,14 @@ static Expr* tryParseGenericApp(Parser* parser, Expr* base)
         // If we have access to a semantic visitor, we can check the base
         // and see if it refers to a generic.
         auto checkedBase = parser->semanticsVisitor->CheckTerm(base);
-        if (auto declRefExpr = as<DeclRefExpr>(checkedBase))
+
+        // If `obj` in `obj.f` has interface type, checking adds a temporary for it and wraps
+        // the result in `LetExpr` bindings. Look inside them to classify `obj.f` itself.
+        Expr* checkedTerm = checkedBase;
+        while (auto letExpr = as<LetExpr>(checkedTerm))
+            checkedTerm = letExpr->body;
+
+        if (auto declRefExpr = as<DeclRefExpr>(checkedTerm))
         {
             if (declRefExpr->declRef.is<GenericDecl>())
             {
@@ -3108,7 +3115,7 @@ static Expr* tryParseGenericApp(Parser* parser, Expr* base)
                 baseKind = BaseGenericKind::NonGeneric;
             }
         }
-        else if (auto overloadedExpr = as<OverloadedExpr>(checkedBase))
+        else if (auto overloadedExpr = as<OverloadedExpr>(checkedTerm))
         {
             baseKind = BaseGenericKind::NonGeneric;
             for (auto candidate : overloadedExpr->lookupResult2)
@@ -3132,13 +3139,11 @@ static Expr* tryParseGenericApp(Parser* parser, Expr* base)
             baseKind = BaseGenericKind::NonGeneric;
         }
 
-        // Checking a `MemberExpr` stores its dereferenced or opened base back into the node,
-        // so checking the unchecked node again can apply `->` to a non-pointer (`p->y` with
-        // `float2* p` would report that `vector<float,2>` cannot be dereferenced). We reuse the
-        // checked node once the kind is decided: `Generic` is only set for a `DeclRefExpr` or
-        // `OverloadedExpr`, which `AddGenericOverloadCandidates` accepts, while an `Unknown`
-        // node may be a `LetExpr` that it rejects, as in `h.o.get<4>()` with an interface `o`.
-        if (as<MemberExpr>(base) && baseKind != BaseGenericKind::Unknown)
+        // Checking a `MemberExpr` modifies the node, so it must not be checked again (`p->y`
+        // would dereference twice). Reuse the checked result once the kind is known, and always
+        // when it has `LetExpr` bindings: without them, `r.next<2>()` updates a copy of `r`.
+        if (as<MemberExpr>(base) &&
+            (baseKind != BaseGenericKind::Unknown || as<LetExpr>(checkedBase)))
         {
             base = checkedBase;
         }

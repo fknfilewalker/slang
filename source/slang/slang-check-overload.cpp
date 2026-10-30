@@ -4046,6 +4046,19 @@ Expr* SemanticsExprVisitor::visitGenericAppExpr(GenericAppExpr* genericAppExpr)
 
     auto& baseExpr = genericAppExpr->functionExpr;
     baseExpr = CheckTerm(baseExpr);
+
+    // The parser already checked the base to decide whether `<` starts generic arguments, so
+    // it may arrive wrapped in `LetExpr` bindings (see `tryParseGenericApp`). Move them here.
+    if (auto exprLocalScope = getExprLocalScope())
+    {
+        while (auto letExpr = as<LetExpr>(baseExpr))
+        {
+            baseExpr = letExpr->body;
+            letExpr->body = nullptr;
+            exprLocalScope->addBinding(letExpr);
+        }
+    }
+
     auto& args = genericAppExpr->arguments;
     for (auto& arg : args)
     {
