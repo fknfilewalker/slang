@@ -22,54 +22,20 @@ void _findDependenciesOfTypeInSet(
     if (!visited.add(type))
         return;
 
-    switch (type->getOp())
+    // An interface type is a dependency when it is in the set. Either way we do not look into
+    // it: its operands are requirement entries, not types held by value.
+    if (type->getOp() == kIROp_InterfaceType)
     {
-    case kIROp_InterfaceType:
-        {
-            auto interfaceType = cast<IRInterfaceType>(type);
-            if (targetSet.contains(interfaceType))
-            {
-                result.add(interfaceType);
-                return;
-            }
-        }
-        break;
-    case kIROp_StructType:
-        {
-            auto structType = cast<IRStructType>(type);
-            for (auto field : structType->getFields())
-            {
-                _findDependenciesOfTypeInSet(field->getFieldType(), targetSet, result, visited);
-            }
-        }
-        break;
-    case kIROp_PtrType:
-    case kIROp_IntPtrType:
-    case kIROp_UIntPtrType:
-    case kIROp_RawPointerType:
-    case kIROp_NativePtrType:
-    case kIROp_ComPtrType:
-    case kIROp_PseudoPtrType:
-    case kIROp_RTTIPointerType:
-    case kIROp_OutParamType:
-    case kIROp_BorrowInOutParamType:
-    case kIROp_RefParamType:
-    case kIROp_BorrowInParamType:
-    case kIROp_NativeStringType:
-    case kIROp_FuncType:
-        // Pointer-like and fixed-size types don't embed their pointee/operand,
-        // so they break dependency cycles. Do not recurse into operand types.
-        break;
-    default:
-        {
-            for (UInt i = 0; i < type->getOperandCount(); i++)
-            {
-                if (auto operandType = as<IRType>(type->getOperand(i)))
-                    _findDependenciesOfTypeInSet(operandType, targetSet, result, visited);
-            }
-        }
-        break;
+        auto interfaceType = cast<IRInterfaceType>(type);
+        if (targetSet.contains(interfaceType))
+            result.add(interfaceType);
+        return;
     }
+
+    List<IRType*> typesHeldByValue;
+    getTypesHeldByValue(type, typesHeldByValue);
+    for (auto heldType : typesHeldByValue)
+        _findDependenciesOfTypeInSet(heldType, targetSet, result, visited);
 }
 
 List<IRInterfaceType*> findDependenciesOfTypeInSet(

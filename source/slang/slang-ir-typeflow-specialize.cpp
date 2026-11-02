@@ -602,15 +602,68 @@ bool isConcreteType(IRInst* inst)
     return true;
 }
 
+// Returns true if `type` is a type variable: a non-concrete type that stands for one type out of a
+// set, chosen at run time. Values of such a type travel as an untagged-union payload, so their info
+// is always an `UntaggedUnionType`.
+//
+// Consider `T.Ctx c = shape.make(x)` inside `runGeneric<T : IShape>`, specialized for a set of
+// shapes. The type of `c` is `lookupWitness(%wt, Ctx)`, which is `Sphere.Ctx` for one table and
+// `Mesh.Ctx` for another. A generic type parameter `%T`, an `ExtractExistentialType`, and the
+// `ThisType`/`AssociatedType` placeholders of interface requirements play the same role.
+//
+// An `UntaggedUnionType` is the lowered form of a type variable: an earlier
+// `specializeDynamicInsts` run writes it in the type variable's place, and its values already are
+// payloads.
+//
+// An attribute does not change which types a type stands for, so a `no_diff T.Ctx` parameter is a
+// type variable as well.
+//
+bool isTypeVariable(IRInst* type)
+{
+    type = unwrapAttributedType(type);
+    if (as<IRUntaggedUnionType>(type))
+        return true;
+    if (!type || isConcreteType(type))
+        return false;
+
+    switch (type->getOp())
+    {
+    case kIROp_LookupWitnessMethod:
+    case kIROp_ExtractExistentialType:
+    case kIROp_ThisType:
+    case kIROp_AssociatedType:
+        return true;
+    case kIROp_Param:
+        return as<IRTypeType>(type->getDataType()) || as<IRTypeKind>(type->getDataType());
+    default:
+        break;
+    }
+
+    // Once `specializeLookupWitnessMethod` rewrites a lookup that selects among several types, the
+    // type variable is the run-time tag over that type set (a `GetTagForMappedSet`). The masks that
+    // type-flow recorded during analysis then refer to the tag, and the dispatcher is built from
+    // them after the rewrite. Without this case the dispatcher of
+    // `assoc-type-bound-to-tuple-or-struct.slang` sees no payload position and gets the callee's
+    // structural info.
+    //
+    if (auto tagType = as<IRSetTagType>(type->getDataType()))
+        return as<IRTypeSet>(tagType->getSet()) != nullptr;
+    return false;
+}
+
 // Returns true if `type` is a propagation-info kind (`TaggedUnionType`, `UntaggedUnionType` or
 // `ElementOfSetType`) rather than an ordinary IR type.
 //
 // An earlier `specializeDynamicInsts` run writes lowered infos back onto the insts it specializes,
 // so a later run can find info where it expects an IR type: as an inst's data type, as a callee's
 // declared result type, or nested inside a structural type. `isConcreteType` is true for these
-// kinds, which are global insts that cannot be refined further. We reuse such info as is, and never
-// wrap it in an `UntaggedUnionType`, because info is not a payload type. Treating it instead as an
-// upper bound for further refinement would be a broader change to the lattice.
+// kinds, which are global insts that cannot be refined further. We reuse such info as is, and do
+// not wrap it in an `UntaggedUnionType` here, because info written in a data type's place describes
+// the value itself rather than a payload. Treating it instead as an upper bound for further
+// refinement would be a broader change to the lattice.
+//
+// A `TaggedUnionType` can still be a payload type in its own right: it is the payload type of a
+// type variable bound to an interface (see `getPayloadType`), and an untagged union may hold it.
 //
 // The test is by exact opcode, so an `IRAttributedType` around one of these kinds is not
 // recognized. `ElementOfSetType` is info as well, although `getLoweredType` writes a `SetTagType`
@@ -913,6 +966,168 @@ static bool typeIncludesDynamicDispatch(IRType* type)
     return false;
 }
 
+// Collect every module-scope witness table for `interfaceType` into `outTables`.
+//
+// `getSet` requires global operands, so block-local tables synthesized by autodiff are left out.
+//
+void collectExistentialTables(IRInterfaceType* interfaceType, HashSet<IRInst*>& outTables)
+{
+    IRWitnessTableType* targetTableType = nullptr;
+    // First, find the IRWitnessTableType that wraps the given interfaceType
+    for (auto use = interfaceType->firstUse; use; use = use->nextUse)
+    {
+        if (auto wtType = as<IRWitnessTableType>(use->getUser()))
+        {
+            if (wtType->getConformanceType() == interfaceType)
+            {
+                targetTableType = wtType;
+                break;
+            }
+        }
+    }
+
+    if (targetTableType)
+    {
+        for (auto use = targetTableType->firstUse; use; use = use->nextUse)
+        {
+            if (auto witnessTable = as<IRWitnessTable>(use->getUser()))
+            {
+                if (witnessTable->getDataType() == targetTableType && isGlobalInst(witnessTable))
+                {
+                    outTables.add(witnessTable);
+                }
+            }
+        }
+    }
+}
+
+// Return the tagged union type over the witness tables in `tableSet`. Its type set holds the
+// concrete type of each table, or the placeholder type element of an unbounded, uninitialized or
+// `none` table.
+//
+IRTaggedUnionType* getTaggedUnionTypeForTables(IRModule* module, IRWitnessTableSet* tableSet)
+{
+    IRBuilder builder(module);
+    HashSet<IRInst*> typeSet;
+
+    forEachInSet(
+        module,
+        tableSet,
+        [&](IRInst* witnessTable)
+        {
+            switch (witnessTable->getOp())
+            {
+            case kIROp_UnboundedWitnessTableElement:
+                typeSet.add(builder.getUnboundedTypeElement(
+                    as<IRUnboundedWitnessTableElement>(witnessTable)->getBaseInterfaceType()));
+                break;
+            case kIROp_WitnessTable:
+                typeSet.add(as<IRWitnessTable>(witnessTable)->getConcreteType());
+                break;
+            case kIROp_UninitializedWitnessTableElement:
+                typeSet.add(builder.getUninitializedTypeElement(
+                    as<IRUninitializedWitnessTableElement>(witnessTable)->getBaseInterfaceType()));
+                break;
+            case kIROp_NoneWitnessTableElement:
+                typeSet.add(builder.getNoneTypeElement());
+                break;
+            }
+        });
+
+    return builder.getTaggedUnionType(
+        tableSet,
+        cast<IRTypeSet>(builder.getSet(kIROp_TypeSet, typeSet)));
+}
+
+IRType* getTypeVariablePayloadType(
+    IRModule* module,
+    IRType* type,
+    IRInterfaceType** outInterfaceWithoutTables,
+    IRType** outUnsupportedType)
+{
+    SLANG_RELEASE_ASSERT(isGlobalInst(type));
+    if (isConcreteType(type))
+        return type;
+
+    IRBuilder builder(module);
+
+    // `Optional<IFoo>` is an existential whose tables include the `none` witness (see
+    // `analyzeMakeOptionalNone`), so it holds a value even if `IFoo` has no conformance. A bare
+    // interface without a conformance has no value, and neither has a type holding it. An
+    // attributed interface (e.g. `[NoDiff] IFoo`) holds the same values as the interface.
+    //
+    const bool isOptionalExistential = isOptionalExistentialType(type);
+    auto interfaceType = isOptionalExistential
+                             ? as<IRInterfaceType>(as<IROptionalType>(type)->getValueType())
+                             : as<IRInterfaceType>(type);
+    if (interfaceType)
+    {
+        HashSet<IRInst*> tables;
+        collectExistentialTables(interfaceType, tables);
+        if (isOptionalExistential)
+            tables.add(builder.getNoneWitnessTableElement());
+        if (tables.getCount() == 0)
+        {
+            if (outInterfaceWithoutTables)
+                *outInterfaceWithoutTables = interfaceType;
+            return nullptr;
+        }
+        return getTaggedUnionTypeForTables(
+            module,
+            cast<IRWitnessTableSet>(builder.getSet(kIROp_WitnessTableSet, tables)));
+    }
+
+    if (auto optionalType = as<IROptionalType>(type))
+    {
+        auto valueType = getTypeVariablePayloadType(
+            module,
+            optionalType->getValueType(),
+            outInterfaceWithoutTables,
+            outUnsupportedType);
+        if (!valueType)
+            return nullptr;
+        return builder.getOptionalType(valueType);
+    }
+
+    if (auto arrayType = as<IRArrayType>(type))
+    {
+        auto elementType = getTypeVariablePayloadType(
+            module,
+            arrayType->getElementType(),
+            outInterfaceWithoutTables,
+            outUnsupportedType);
+        if (!elementType)
+            return nullptr;
+        return builder.getArrayType(
+            elementType,
+            arrayType->getElementCount(),
+            getArrayStride(arrayType));
+    }
+
+    if (auto tupleType = as<IRTupleType>(type))
+    {
+        List<IRType*> elementTypes;
+        for (UInt i = 0; i < tupleType->getOperandCount(); i++)
+        {
+            auto elementType = getTypeVariablePayloadType(
+                module,
+                (IRType*)tupleType->getOperand(i),
+                outInterfaceWithoutTables,
+                outUnsupportedType);
+            if (!elementType)
+                return nullptr;
+            elementTypes.add(elementType);
+        }
+        return builder.getTupleType(elementTypes);
+    }
+
+    // Type-flow has no info for the values of any other non-concrete type, such as
+    // `Conditional<IFoo, true>`, so it cannot choose a payload type for them.
+    if (outUnsupportedType)
+        *outUnsupportedType = type;
+    return nullptr;
+}
+
 // Parent context for the full type-flow pass.
 struct TypeFlowSpecializationContext
 {
@@ -956,39 +1171,7 @@ struct TypeFlowSpecializationContext
         if (auto cached = taggedUnionTypeCache.tryGetValue(tableSet))
             return *cached;
 
-        IRBuilder builder(module);
-        HashSet<IRInst*> typeSet;
-
-        // Create a type set out of the base types from each table.
-        forEachInSet(
-            module,
-            tableSet,
-            [&](IRInst* witnessTable)
-            {
-                switch (witnessTable->getOp())
-                {
-                case kIROp_UnboundedWitnessTableElement:
-                    typeSet.add(builder.getUnboundedTypeElement(
-                        as<IRUnboundedWitnessTableElement>(witnessTable)->getBaseInterfaceType()));
-                    break;
-                case kIROp_WitnessTable:
-                    typeSet.add(as<IRWitnessTable>(witnessTable)->getConcreteType());
-                    break;
-                case kIROp_UninitializedWitnessTableElement:
-                    typeSet.add(builder.getUninitializedTypeElement(
-                        as<IRUninitializedWitnessTableElement>(witnessTable)
-                            ->getBaseInterfaceType()));
-                    break;
-                case kIROp_NoneWitnessTableElement:
-                    typeSet.add(builder.getNoneTypeElement());
-                    break;
-                }
-            });
-
-        // Create the tagged union type out of the type and table collection.
-        auto result = builder.getTaggedUnionType(
-            tableSet,
-            cast<IRTypeSet>(builder.getSet(kIROp_TypeSet, typeSet)));
+        auto result = getTaggedUnionTypeForTables(module, tableSet);
         taggedUnionTypeCache[tableSet] = result;
         return result;
     }
@@ -1060,6 +1243,12 @@ struct TypeFlowSpecializationContext
     //
     IRUntaggedUnionType* makeUntaggedUnionType(IRTypeSet* typeSet)
     {
+        // The payload of an untagged union is stored by value, so every element must be a
+        // concrete type. A type variable bound to a non-concrete type holds its payload type
+        // instead (see `getPayloadType`).
+        //
+        for (UInt i = 0; i < typeSet->getCount(); i++)
+            SLANG_ASSERT(isConcreteType(typeSet->getElement(i)));
         IRBuilder builder(module);
         return builder.getUntaggedUnionType(typeSet);
     }
@@ -1093,6 +1282,382 @@ struct TypeFlowSpecializationContext
     {
         IRBuilder builder(module);
         return builder.getSetTagType(set);
+    }
+
+    // Return the declared function type of a calling context, i.e. the signature the callee was
+    // written with, before type-flow refines it. A `SpecializeExistentialsInFunc` has no type of
+    // its own, so we read the type of the function it binds.
+    //
+    IRFuncType* getDeclaredFuncType(IRInst* context)
+    {
+        if (auto existentialSpecializedFunc = as<IRSpecializeExistentialsInFunc>(context))
+            context = getFuncDefinitionForContext(existentialSpecializedFunc);
+        auto funcType = as<IRFuncType>(context->getDataType());
+        SLANG_RELEASE_ASSERT(funcType);
+        return funcType;
+    }
+
+    // Return the payload type of the declared type `type` (see `getTypeVariablePayloadType`),
+    // which is also the sealed info of `type`: the widest info a value of `type` can have, with
+    // each interface in it the tagged union over all of its witness tables. The structural shapes
+    // are the ones that `makeInfoForConcreteType` and the `analyzeMake*` functions build, so the
+    // sealed info unions with any narrower info of the same declared type and stays the same, and
+    // a tagged union lowers to itself, so the sealed info is already a lowered type.
+    //
+    // We use it where type-flow cannot pair the writer of a value with its reader, which is the
+    // payload of a type variable (see `isTypeVariable`). If `type` holds an interface without a
+    // conformance, no value of `type` exists, and if it holds a type that type-flow cannot
+    // refine, such as `Conditional<IFoo, true>`, no payload type exists. We report each such
+    // interface or type once and return none.
+    //
+    IRType* getPayloadType(IRInst* type, SourceLoc loc)
+    {
+        IRInterfaceType* interfaceWithoutTables = nullptr;
+        IRType* unsupportedType = nullptr;
+        auto payloadType = getTypeVariablePayloadType(
+            module,
+            (IRType*)type,
+            &interfaceWithoutTables,
+            &unsupportedType);
+        if (payloadType)
+            return payloadType;
+
+        if (interfaceWithoutTables)
+        {
+            if (diagnosedNoTypeConformancesInterfaces.add(interfaceWithoutTables))
+            {
+                StringBuilder typeStr;
+                printDiagnosticArg(typeStr, interfaceWithoutTables);
+                sink->diagnose(Diagnostics::NoTypeConformancesFoundForInterface{
+                    .interfaceType = typeStr.produceString(),
+                    .location = loc});
+            }
+        }
+        else if (diagnosedUnsupportedPayloadTypes.add(unsupportedType))
+        {
+            sink->diagnose(Diagnostics::TypeCannotBePackedIntoAnyValue{
+                .type = unsupportedType,
+                .location = loc});
+        }
+        return nullptr;
+    }
+
+    // Returns true if a callee parameter or result of the declared type `declaredType` is reached
+    // through a caller position of type `maskType` as a payload. That happens when the caller sees
+    // a type variable and the callee sees a type that is not itself a type variable, e.g. `T.Ctx`
+    // at the call to `shape.make` and `Tuple<IBsdf, float>` in `Sphere.make`.
+    //
+    // The declared type can be concrete: `float` in `S0.make`, or the `TaggedUnionType` that an
+    // earlier `specializeDynamicInsts` run wrote in place of `IA` in `S1.make` (see
+    // `isRefinedInfoType`). Its payload type is then the declared type itself, so the caller
+    // still sees the untagged union of it rather than the callee's own info.
+    //
+    bool isPayloadPosition(IRInst* maskType, IRInst* declaredType)
+    {
+        return isTypeVariable(maskType) && !isTypeVariable(declaredType);
+    }
+
+    // Returns true if a value of the declared type `declaredType` reaching the caller position
+    // `maskType` has a payload position (see `isPayloadPosition`) anywhere inside it.
+    //
+    // Payload positions can be nested in the structural types that `unionPropagationInfo` merges
+    // element-wise: tuples, arrays and optionals. Consider the call to the primal half of a
+    // dispatched backward derivative, which returns `Tuple<float, s_minCtx_Sphere>` in
+    // `Sphere.shade` and is seen by the caller as `Tuple<float, T.MinimalContext>`. Only the
+    // second element crosses the dispatch as a payload. A requirement returning `Ctx[2]` or
+    // `Optional<Ctx>` likewise carries a payload in each element or in the value.
+    //
+    bool hasPayloadPosition(IRInst* maskType, IRInst* declaredType)
+    {
+        if (isPayloadPosition(maskType, declaredType))
+            return true;
+
+        if (auto maskTuple = as<IRTupleType>(maskType))
+        {
+            auto declaredTuple = as<IRTupleType>(declaredType);
+            if (!declaredTuple || maskTuple->getOperandCount() != declaredTuple->getOperandCount())
+                return false;
+            for (UInt i = 0; i < maskTuple->getOperandCount(); i++)
+                if (hasPayloadPosition(maskTuple->getOperand(i), declaredTuple->getOperand(i)))
+                    return true;
+            return false;
+        }
+
+        if (auto maskArray = as<IRArrayType>(maskType))
+        {
+            auto declaredArray = as<IRArrayType>(declaredType);
+            return declaredArray &&
+                   hasPayloadPosition(maskArray->getElementType(), declaredArray->getElementType());
+        }
+
+        if (auto maskOptional = as<IROptionalType>(maskType))
+        {
+            auto declaredOptional = as<IROptionalType>(declaredType);
+            return declaredOptional && hasPayloadPosition(
+                                           maskOptional->getValueType(),
+                                           declaredOptional->getValueType());
+        }
+
+        return false;
+    }
+
+    // Which side of a call a converted info is for (see `mapPayloadPositions`).
+    enum class PayloadView
+    {
+        // The caller, which sees the untagged union of the payload type at a payload position.
+        Caller,
+        // The callee, which sees the sealed info of its declared type there.
+        Callee,
+    };
+
+    // Return `info`, the info of a value of the declared type `declaredType` at the caller
+    // position `maskType`, with the info at each payload position inside it (see
+    // `hasPayloadPosition`) replaced by what `view` sees there. Every other part of `info` is
+    // kept. `info` may be null, or a tuple info with null elements, where nothing is known yet;
+    // the result is then null or partial in the same places.
+    //
+    // Consider `Sphere.make` returning `Tuple<IBsdf, float>` through `T.Ctx`. The caller sees
+    // `UntaggedUnion({Tuple(TaggedUnion({Diffuse, Plastic}), float)})`, whatever `Sphere.make`
+    // returns, and the callee must return at least the sealed info
+    // `Tuple(TaggedUnion({Diffuse, Plastic}), float)` so that the two agree (see
+    // `getPayloadType`).
+    //
+    // An attribute such as the `no_diff` of a `no_diff Tuple<Ctx, float>` parameter does not change
+    // where the payload positions are or what the payload types are, so we map the info without
+    // attributes and return it without them. The sealed info is the payload type that the
+    // dispatcher unpacks, and `upcastSet` likewise drops attributes.
+    //
+    IRInst* mapPayloadPositions(
+        IRInst* maskType,
+        IRInst* declaredType,
+        IRInst* info,
+        PayloadView view,
+        SourceLoc loc)
+    {
+        if (!hasPayloadPosition(maskType, declaredType))
+            return info;
+
+        maskType = unwrapAttributedType(maskType);
+        declaredType = unwrapAttributedType(declaredType);
+        info = unwrapAttributedType(info);
+
+        if (isPayloadPosition(maskType, declaredType))
+        {
+            // The callee sees the sealed info of its declared type, never the caller's untagged
+            // union. For a concrete declared type, such as the `float` of `Tuple<float, IA>` in
+            // an implementation that binds `Ctx = float`, the sealed info is the type itself,
+            // which is also the info that `makeInfoForConcreteType` gives a value of that type.
+            if (view == PayloadView::Callee)
+                return getPayloadType(declaredType, loc);
+
+            auto payloadType = getPayloadType(declaredType, loc);
+            if (!payloadType)
+                return none();
+            IRBuilder builder(module);
+            return makeUntaggedUnionType(
+                cast<IRTypeSet>(builder.getSingletonSet(kIROp_TypeSet, payloadType)));
+        }
+
+        // Only tuples, arrays and optionals can hold a payload position (see
+        // `hasPayloadPosition`), and the info of a value at such a position has the same
+        // structure: a tuple info (possibly with null elements), an array info, or an optional
+        // info or `OptionalNoneType`.
+        IRBuilder builder(module);
+        if (auto maskTuple = as<IRTupleType>(maskType))
+        {
+            auto declaredTuple = cast<IRTupleType>(declaredType);
+            auto infoTuple = as<IRTupleType>(info);
+            SLANG_RELEASE_ASSERT(!info || infoTuple);
+
+            List<IRType*> elementInfos;
+            for (UInt i = 0; i < declaredTuple->getOperandCount(); i++)
+            {
+                elementInfos.add((IRType*)mapPayloadPositions(
+                    maskTuple->getOperand(i),
+                    declaredTuple->getOperand(i),
+                    infoTuple ? infoTuple->getOperand(i) : nullptr,
+                    view,
+                    loc));
+            }
+            return builder.getTupleType(elementInfos);
+        }
+
+        if (auto maskArray = as<IRArrayType>(maskType))
+        {
+            auto declaredArray = cast<IRArrayType>(declaredType);
+            SLANG_RELEASE_ASSERT(!info || as<IRArrayType>(info));
+
+            auto elementInfo = mapPayloadPositions(
+                maskArray->getElementType(),
+                declaredArray->getElementType(),
+                info ? as<IRArrayType>(info)->getElementType() : nullptr,
+                view,
+                loc);
+            if (!elementInfo)
+                return none();
+            return builder.getArrayType(
+                (IRType*)elementInfo,
+                declaredArray->getElementCount(),
+                getArrayStride(declaredArray));
+        }
+
+        auto maskOptional = cast<IROptionalType>(maskType);
+        auto declaredOptional = cast<IROptionalType>(declaredType);
+
+        // The caller sees an optional of a payload, such as `Optional<T.Ctx>`, but if the callee
+        // binds `Ctx` to an interface `IA`, its `Optional<IA>` is an existential whose info is a
+        // tagged union that includes the `none` witness (see `analyzeMakeOptionalNone`). The two
+        // sides then lay out the value differently, and we report the program as unsupported
+        // rather than convert between them.
+        //
+        if (isOptionalExistentialType(declaredOptional))
+        {
+            if (diagnosedOptionalExistentialPayloadTypes.add(declaredOptional))
+            {
+                StringBuilder interfaceStr;
+                printDiagnosticArg(interfaceStr, declaredOptional->getValueType());
+                sink->diagnose(Diagnostics::OptionalOfInterfaceAsAssociatedTypePayload{
+                    .interfaceType = interfaceStr.produceString(),
+                    .location = loc});
+            }
+            return none();
+        }
+
+        SLANG_RELEASE_ASSERT(!info || as<IROptionalType>(info) || as<IROptionalNoneType>(info));
+
+        auto valueInfo = mapPayloadPositions(
+            maskOptional->getValueType(),
+            declaredOptional->getValueType(),
+            as<IROptionalType>(info) ? as<IROptionalType>(info)->getValueType() : nullptr,
+            view,
+            loc);
+        if (!valueInfo)
+            return none();
+        return builder.getOptionalType((IRType*)valueInfo);
+    }
+
+    // Apply `mapPayloadPositions` to the info of a parameter, whose declared type and caller
+    // position type may carry a parameter direction (`out`, `inout`, ...) around the value type.
+    //
+    IRInst* mapPayloadPositionsOfParam(
+        IRType* maskParamType,
+        IRType* declaredParamType,
+        IRInst* info,
+        PayloadView view,
+        SourceLoc loc)
+    {
+        const auto [maskDirection, maskValueType] = splitParameterDirectionAndType(maskParamType);
+        const auto [declaredDirection, declaredValueType] =
+            splitParameterDirectionAndType(declaredParamType);
+        if (!hasPayloadPosition(maskValueType, declaredValueType))
+            return info;
+
+        if (declaredDirection.kind == ParameterDirectionInfo::Kind::In)
+            return mapPayloadPositions(maskValueType, declaredValueType, info, view, loc);
+
+        auto valueInfo = info ? as<IRPtrTypeBase>(info)->getValueType() : nullptr;
+        auto mappedValueInfo =
+            mapPayloadPositions(maskValueType, declaredValueType, valueInfo, view, loc);
+        if (!mappedValueInfo)
+            return none();
+        IRBuilder builder(module);
+        return fromDirectionAndType(&builder, declaredDirection, (IRType*)mappedValueInfo);
+    }
+
+    // Return the part of `info`, the caller's info of an argument of the declared type
+    // `declaredType` at the caller position `maskType`, that a `SpecializeExistentialsInFunc`
+    // binds (see `maybeGetBoundFunc`), or null if no part of it needs a binding. We keep the
+    // info at each position that is neither concrete nor a payload position (see
+    // `isPayloadPosition`), and leave the other positions of a tuple null.
+    //
+    // Consider `float use(Tuple<Ctx, IA> c)` dispatched through `T : IShape`, with the
+    // argument info `Tuple(UntaggedUnion({...}), TaggedUnion({A0}))`. The binding is
+    // `Tuple(null, TaggedUnion({A0}))`: the `IA` element is specialized per call site, while
+    // the `Ctx` element is a packed payload whose callee-side info is fixed by each
+    // implementation's declared type (see `getPayloadType`). The binding then depends only on
+    // the caller, so every implementation in a dispatched set gets the same binding, which
+    // `collectDispatchActions` requires. We decide by the caller's `maskType` rather than the
+    // declared type for the same reason.
+    //
+    IRInst* getBindingInfo(IRInst* maskType, IRInst* declaredType, IRInst* info)
+    {
+        maskType = unwrapAttributedType(maskType);
+        declaredType = unwrapAttributedType(declaredType);
+        info = unwrapAttributedType(info);
+
+        if (!info || isConcreteType(maskType) || isPayloadPosition(maskType, declaredType))
+            return none();
+        if (!hasPayloadPosition(maskType, declaredType))
+            return info;
+
+        // Only tuples, arrays and optionals can hold a payload position (see
+        // `hasPayloadPosition`), and the info at such a position has the same structure (see
+        // `mapPayloadPositions`).
+        IRBuilder builder(module);
+        if (auto maskTuple = as<IRTupleType>(maskType))
+        {
+            auto declaredTuple = cast<IRTupleType>(declaredType);
+            auto infoTuple = cast<IRTupleType>(info);
+            List<IRType*> elementInfos;
+            bool hasElementBinding = false;
+            for (UInt i = 0; i < maskTuple->getOperandCount(); i++)
+            {
+                auto elementInfo = getBindingInfo(
+                    maskTuple->getOperand(i),
+                    declaredTuple->getOperand(i),
+                    infoTuple->getOperand(i));
+                hasElementBinding |= elementInfo != nullptr;
+                elementInfos.add((IRType*)elementInfo);
+            }
+            return hasElementBinding ? builder.getTupleType(elementInfos) : none();
+        }
+
+        if (auto maskArray = as<IRArrayType>(maskType))
+        {
+            auto infoArray = cast<IRArrayType>(info);
+            auto elementInfo = getBindingInfo(
+                maskArray->getElementType(),
+                cast<IRArrayType>(declaredType)->getElementType(),
+                infoArray->getElementType());
+            if (!elementInfo)
+                return none();
+            return builder.getArrayType(
+                (IRType*)elementInfo,
+                infoArray->getElementCount(),
+                getArrayStride(infoArray));
+        }
+
+        // The info of an optional is an optional info, or `OptionalNoneType` for a value that
+        // is known to be `none`, which holds nothing to bind.
+        auto maskOptional = cast<IROptionalType>(maskType);
+        auto infoOptional = as<IROptionalType>(info);
+        SLANG_RELEASE_ASSERT(infoOptional || as<IROptionalNoneType>(info));
+        if (!infoOptional)
+            return none();
+        auto valueInfo = getBindingInfo(
+            maskOptional->getValueType(),
+            cast<IROptionalType>(declaredType)->getValueType(),
+            infoOptional->getValueType());
+        if (!valueInfo)
+            return none();
+        return builder.getOptionalType((IRType*)valueInfo);
+    }
+
+    // Apply `getBindingInfo` to the info of an argument for a parameter of the value type
+    // `declaredValueType`, which is a pointer info for a parameter with a direction such as
+    // `inout` (see `convertArgInfosToParamInfos` in `analyzeCall`).
+    //
+    IRInst* getBindingInfoOfParam(IRInst* maskValueType, IRInst* declaredValueType, IRInst* info)
+    {
+        auto ptrInfo = as<IRPtrTypeBase>(info);
+        if (!ptrInfo)
+            return getBindingInfo(maskValueType, declaredValueType, info);
+
+        auto valueInfo = getBindingInfo(maskValueType, declaredValueType, ptrInfo->getValueType());
+        if (!valueInfo)
+            return none();
+        IRBuilder builder(module);
+        return builder.getPtrTypeWithAddressSpace((IRType*)valueInfo, ptrInfo);
     }
 
     IRInst* _tryGetInfo(InstWithContext element)
@@ -1284,6 +1849,11 @@ struct TypeFlowSpecializationContext
         if (as<IROptionalNoneType>(info1) && (as<IROptionalType>(info2)))
             return info2;
 
+        // Infos at a non-structural, non-concrete position are set composites of the same kind:
+        // tagged unions at an existential, untagged unions at a type variable, element-of-set or
+        // tag infos at a witness table, function or generic. A structural info reaching a type
+        // variable means a payload position was not converted (see `mapPayloadPositions`).
+        //
         SLANG_UNEXPECTED("Incompatible propagation infos during union");
     }
 
@@ -1326,6 +1896,11 @@ struct TypeFlowSpecializationContext
         {
             auto tuple1 = as<IRTupleType>(info1);
             auto tuple2 = as<IRTupleType>(info2);
+
+            // Every info at a tuple-typed position is a tuple info. A packed payload never
+            // reaches one, because a callee parameter at a payload position is seeded with its
+            // sealed info instead of the caller's argument info.
+            SLANG_RELEASE_ASSERT(tuple1 && tuple2);
 
             IRBuilder builder(module);
             List<IRType*> elementInfos;
@@ -2081,6 +2656,13 @@ struct TypeFlowSpecializationContext
                 if (!firstBlock)
                     return;
 
+                // The callee's signature as the caller sees it, which tells us which
+                // parameters are payload positions.
+                IRFuncType* callSiteMask = nullptr;
+                if (auto callSiteFuncTypePtr = this->callSiteFuncType.tryGetValue(
+                        InstWithContext(edge.callerContext, callInst)))
+                    callSiteMask = maybeExpandFuncType(*callSiteFuncTypePtr);
+
                 UInt argIndex = 1; // Skip callee (operand 0)
                 for (auto param : firstBlock->getParams())
                 {
@@ -2129,6 +2711,31 @@ struct TypeFlowSpecializationContext
                             continue;
                         }
 
+                        // At a payload position the argument is a packed payload, so the
+                        // callee's view of it is fully determined by its declared type: it is
+                        // the sealed info, whose lowered type the dispatcher unpacks into (see
+                        // `getPayloadType`). We replace the caller's info there.
+                        //
+                        IRType* maskValueType = nullptr;
+                        if (callSiteMask && argIndex - 1 < callSiteMask->getParamCount())
+                        {
+                            const auto [maskDirection, maskValueTypeOfParam] =
+                                splitParameterDirectionAndType(
+                                    callSiteMask->getParamType(argIndex - 1));
+                            maskValueType = maskValueTypeOfParam;
+                        }
+                        auto toCalleeView = [&](IRInst* valueInfo) -> IRInst*
+                        {
+                            if (!maskValueType)
+                                return valueInfo;
+                            return mapPayloadPositions(
+                                maskValueType,
+                                paramType,
+                                valueInfo,
+                                PayloadView::Callee,
+                                callInst->sourceLoc);
+                        };
+
                         IRInst* argInfo =
                             tryGetArgInfo(edge.callerContext, arg, param->getDataType());
 
@@ -2140,12 +2747,15 @@ struct TypeFlowSpecializationContext
                         case ParameterDirectionInfo::Kind::Ref:
                             {
                                 IRBuilder builder(module);
-                                if (!argInfo)
+                                IRInst* valueInfo = nullptr;
+                                if (argInfo)
+                                    valueInfo = matchAttributes(
+                                        as<IRPtrTypeBase>(argInfo)->getValueType(),
+                                        paramType);
+                                valueInfo = toCalleeView(valueInfo);
+                                if (!valueInfo)
                                     break;
 
-                                auto valueInfo = matchAttributes(
-                                    as<IRPtrTypeBase>(argInfo)->getValueType(),
-                                    paramType);
                                 auto newInfo = fromDirectionAndType(
                                     &builder,
                                     paramDirection,
@@ -2160,7 +2770,7 @@ struct TypeFlowSpecializationContext
                             }
                         case ParameterDirectionInfo::Kind::In:
                             {
-                                argInfo = matchAttributes(argInfo, paramType);
+                                argInfo = toCalleeView(matchAttributes(argInfo, paramType));
                                 updateInfoForMerge(
                                     edge.targetContext,
                                     param,
@@ -2187,30 +2797,23 @@ struct TypeFlowSpecializationContext
                 //
                 if (!isConcreteType(callInst->getDataType()))
                 {
-                    auto returnInfoPtr = funcReturnInfo.tryGetValue(targetCallee);
-                    auto returnInfo = (returnInfoPtr) ? *returnInfoPtr : nullptr;
-                    if (!returnInfo)
-                    {
-                        // If the targetCallee's return type is concrete, but the
-                        // callInst's return type is not, we should still propagate the
-                        // known concrete type. The return type may also be info that an
-                        // earlier `specializeDynamicInsts` run wrote there, which
-                        // `makeInfoForConcreteType` returns unchanged.
-                        //
-                        IRInst* calleeForType = targetCallee;
-                        if (auto fwb = as<IRSpecializeExistentialsInFunc>(targetCallee))
-                            calleeForType = getFuncDefinitionForContext(fwb);
-                        auto concreteReturnType =
-                            cast<IRFuncType>(calleeForType->getDataType())->getResultType();
-                        if (isConcreteType(concreteReturnType))
-                        {
-                            IRBuilder builder(module);
-                            returnInfo = makeInfoForConcreteType(
-                                module,
-                                concreteReturnType,
-                                callInst->getDataType());
-                        }
-                    }
+                    // At a payload position the callee must return exactly the payload type
+                    // that the caller unpacks, so we seed its return info with the sealed info
+                    // of its declared result type (see `getPayloadType`).
+                    //
+                    auto declaredResultType = getDeclaredFuncType(targetCallee)->getResultType();
+                    if (auto sealedInfo = mapPayloadPositions(
+                            callInst->getDataType(),
+                            declaredResultType,
+                            nullptr,
+                            PayloadView::Callee,
+                            callInst->sourceLoc))
+                        updateFuncReturnInfo(targetCallee, sealedInfo, workQueue);
+
+                    auto returnInfo = getReturnInfoForCaller(
+                        targetCallee,
+                        callInst->getDataType(),
+                        callInst->sourceLoc);
 
                     if (returnInfo)
                     {
@@ -3489,6 +4092,7 @@ struct TypeFlowSpecializationContext
         if (auto elementOfSetType = as<IRElementOfSetType>(witnessTableInfo))
         {
             IRBuilder builder(module);
+            auto setOp = getSetOpFromType(inst->getDataType());
             HashSet<IRInst*>& results = *module->getContainerPool().getHashSet<IRInst>();
             forEachInSet(
                 module,
@@ -3536,10 +4140,24 @@ struct TypeFlowSpecializationContext
                         return;
                     }
 
-                    results.add(findWitnessTableEntry(witnessTab, key));
+                    // An associated type is a type variable, so the type it selects is the
+                    // payload type of the entry (see `getPayloadType`). Every value typed by
+                    // this lookup and every generic specialized with it then sees the same
+                    // concrete type.
+                    //
+                    // The entry can be a placeholder that autodiff translates lazily, such as the
+                    // `BackwardDiffMinimalContextType` of a dispatched backward derivative. The
+                    // placeholder looks concrete, but the tuple it translates to can hold
+                    // existentials, so we take the payload type of the translated entry.
+                    //
+                    auto entry = findWitnessTableEntry(witnessTab, key);
+                    if (setOp == kIROp_TypeSet)
+                        entry =
+                            getPayloadType(translationContext.resolveInst(entry), inst->sourceLoc);
+                    if (entry)
+                        results.add(entry);
                 });
 
-            auto setOp = getSetOpFromType(inst->getDataType());
             auto resultSetType = makeElementOfSetType(builder.getSet(setOp, results));
             module->getContainerPool().free(&results);
 
@@ -4280,7 +4898,14 @@ struct TypeFlowSpecializationContext
     // info for them yet (not ready to propagate). The caller should skip adding
     // the propagation edge in this case.
     //
-    IRInst* maybeGetBoundFunc(IRInst* callee, List<IRInst*>& paramInfos, WorkQueue<WorkItem>&)
+    // `callSiteMask` is the callee's signature as the caller sees it, which identifies the
+    // payload positions (see `hasPayloadPosition`).
+    //
+    IRInst* maybeGetBoundFunc(
+        IRInst* callee,
+        IRFuncType* callSiteMask,
+        List<IRInst*>& paramInfos,
+        WorkQueue<WorkItem>&)
     {
         // Only handle direct (non-generic, non-intrinsic) functions.
         IRFunc* func = as<IRFunc>(callee);
@@ -4311,7 +4936,7 @@ struct TypeFlowSpecializationContext
             const auto [paramDirection, paramType] =
                 splitParameterDirectionAndType(param->getDataType());
 
-            // There are three cases where we don't need to create a binding for a parameter:
+            // There are four cases where we don't need to create a binding for a parameter:
             // (i) Concrete parameter: if the parameter is already concrete, we don't need to bind
             //     it.
             // (ii) Out parameter: we currently only support specialization based on input
@@ -4320,6 +4945,10 @@ struct TypeFlowSpecializationContext
             //     de-functionalization here, and do so in a
             //     later pass. If we eventually merged these two passes, we could remove
             //     this exception and handle FuncType parameters with bindings as well.
+            // (iv) Payload position: the argument is or holds a packed payload whose callee-side
+            //     info is fixed by the declared type (see `getPayloadType`), so a binding would
+            //     add nothing there. We bind only the other non-concrete parts of such a parameter
+            //     (see `getBindingInfo`), and no binding is left if it has none.
             //
             if (isConcreteType(paramType) || paramDirection == ParameterDirectionInfo::Kind::Out ||
                 paramType->getOp() == kIROp_FuncType)
@@ -4334,6 +4963,14 @@ struct TypeFlowSpecializationContext
             // Non-concrete parameter: check if we have param binding info.
             IRInst* paramInfo =
                 (argIndex < (UInt)paramInfos.getCount()) ? paramInfos[argIndex] : nullptr;
+
+            if (paramInfo && callSiteMask && argIndex < callSiteMask->getParamCount())
+            {
+                const auto [maskDirection, maskValueType] =
+                    splitParameterDirectionAndType(callSiteMask->getParamType(argIndex));
+                if (hasPayloadPosition(maskValueType, paramType))
+                    paramInfo = getBindingInfoOfParam(maskValueType, paramType, paramInfo);
+            }
 
             if (!paramInfo)
             {
@@ -4688,6 +5325,12 @@ struct TypeFlowSpecializationContext
         if (isNoneCallee(callee))
             return none();
 
+        // The callee's signature as this call site sees it. It is recorded in `callSiteFuncType`
+        // below, and identifies the payload positions (see `hasPayloadPosition`).
+        IRFuncType* callSiteMask = as<IRFuncType>(callee->getDataType());
+        if (callSiteMask)
+            callSiteMask = maybeExpandFuncType(callSiteMask);
+
         HashSet<IRInst*> calleeSet;
         auto propagateToCallSite = [&](IRInst* callee)
         {
@@ -4815,7 +5458,8 @@ struct TypeFlowSpecializationContext
                 }
                 auto paramInfos =
                     convertArgInfosToParamInfos(cast<IRFuncType>(resolvedFunc->getDataType()));
-                if (auto boundCallee = maybeGetBoundFunc(resolvedFunc, paramInfos, workQueue))
+                if (auto boundCallee =
+                        maybeGetBoundFunc(resolvedFunc, callSiteMask, paramInfos, workQueue))
                     propagateToCallSite(boundCallee);
             }
 
@@ -4829,7 +5473,8 @@ struct TypeFlowSpecializationContext
 
             auto paramInfos =
                 convertArgInfosToParamInfos(cast<IRFuncType>(resolvedCallee->getDataType()));
-            if (auto boundCallee = maybeGetBoundFunc(resolvedCallee, paramInfos, workQueue))
+            if (auto boundCallee =
+                    maybeGetBoundFunc(resolvedCallee, callSiteMask, paramInfos, workQueue))
                 propagateToCallSite(boundCallee);
         }
 
@@ -5064,6 +5709,11 @@ struct TypeFlowSpecializationContext
         }
     }
 
+    // Return the info of each parameter of `context`, as seen by a caller whose parameter
+    // positions have the types of `funcTypeUnionMask`. At a payload position (see
+    // `hasPayloadPosition`) the caller sees the untagged union of the payload type rather than the
+    // callee's own structural info.
+    //
     List<IRInst*> getParamInfos(IRInst* context, IRFuncType* funcTypeUnionMask)
     {
         auto baseFunc = getFuncDefinitionForContext(context);
@@ -5071,20 +5721,20 @@ struct TypeFlowSpecializationContext
         UInt index = 0;
         for (auto param : baseFunc->getParams())
         {
-            if (auto paramInfo = tryGetInfo(context, param))
-                paramInfos.add(paramInfo);
-            else if (isConcreteType(param->getDataType()))
-            {
-                paramInfos.add(makeInfoForConcreteType(
-                    module,
-                    param->getDataType(),
-                    funcTypeUnionMask->getParamType(index)));
-            }
-            else
-            {
-                // Info not ready yet.
-                paramInfos.add(nullptr);
-            }
+            SLANG_RELEASE_ASSERT(index < funcTypeUnionMask->getParamCount());
+            auto maskType = funcTypeUnionMask->getParamType(index);
+            SLANG_RELEASE_ASSERT(maskType);
+            IRInst* paramInfo = tryGetInfo(context, param);
+            if (!paramInfo && isConcreteType(param->getDataType()))
+                paramInfo = makeInfoForConcreteType(module, param->getDataType(), maskType);
+
+            // A null info means the info is not ready yet.
+            paramInfos.add(mapPayloadPositionsOfParam(
+                maskType,
+                param->getDataType(),
+                paramInfo,
+                PayloadView::Caller,
+                param->sourceLoc));
 
             index++;
         }
@@ -5231,6 +5881,31 @@ struct TypeFlowSpecializationContext
         //
         funcReturnInfo.addIfNotExists(context, none());
         return funcReturnInfo[context];
+    }
+
+    // Return the info of the value that a call to `context` produces, as seen by a caller whose
+    // result position has the type `maskType`.
+    //
+    // The caller sees the callee's return info, or, if the callee's declared result type is
+    // concrete, that type shaped by `maskType`. The declared result type may also be info that an
+    // earlier `specializeDynamicInsts` run wrote there, which `makeInfoForConcreteType` returns
+    // unchanged. At a payload position (see `hasPayloadPosition`) the caller instead sees the
+    // untagged union of the payload type, because the callee's structural info cannot be packed
+    // as it is.
+    //
+    IRInst* getReturnInfoForCaller(IRInst* context, IRType* maskType, SourceLoc loc)
+    {
+        auto declaredResultType = getDeclaredFuncType(context)->getResultType();
+        IRInst* returnInfo = getFuncReturnInfo(context);
+        if (!returnInfo && isConcreteType(declaredResultType))
+            returnInfo = makeInfoForConcreteType(module, declaredResultType, maskType);
+
+        return mapPayloadPositions(
+            maskType,
+            declaredResultType,
+            returnInfo,
+            PayloadView::Caller,
+            loc);
     }
 
     // Set up initial information for parameters based on their types.
@@ -5543,13 +6218,16 @@ struct TypeFlowSpecializationContext
                     this->callSiteInfo[InstWithContext(clonedFunc, kv.second)] =
                         this->callSiteInfo[InstWithContext(existentialSpecializedFunc, kv.first)];
                 }
-                if (this->callSiteFuncType.containsKey(
+                // The recorded func type can be a local inst of the base function, when it
+                // refers to a local type such as a witness lookup. The base function is
+                // specialized on its own, which removes that local func type, so the clone's
+                // call site records the clone of the func type instead.
+                //
+                if (auto funcTypePtr = this->callSiteFuncType.tryGetValue(
                         InstWithContext(existentialSpecializedFunc, kv.first)))
                 {
                     this->callSiteFuncType[InstWithContext(clonedFunc, kv.second)] =
-                        this->callSiteFuncType[InstWithContext(
-                            existentialSpecializedFunc,
-                            kv.first)];
+                        cast<IRFuncType>(findCloneForOperand(&cloneEnv, *funcTypePtr));
                 }
             }
         }
@@ -6283,38 +6961,10 @@ struct TypeFlowSpecializationContext
             for (Index i = 0; i < paramInfos.getCount(); i++)
                 updateParamType(i, paramInfos[i]);
 
-            if (auto resultInfo = getFuncReturnInfo(context))
-            {
-                resultType = updateType(resultTypeUnionMask, resultType, (IRType*)resultInfo);
-            }
-            else if (auto funcType = as<IRFuncType>(context->getDataType()))
-            {
-                SLANG_ASSERT(isGlobalInst(funcType->getResultType()));
-                resultType = updateType(
-                    resultTypeUnionMask,
-                    resultType,
-                    (IRType*)makeInfoForConcreteType(
-                        module,
-                        funcType->getResultType(),
-                        resultTypeUnionMask));
-            }
-            else if (auto boundFuncContext = as<IRSpecializeExistentialsInFunc>(context))
-            {
-                auto baseFuncForType = getFuncDefinitionForContext(boundFuncContext);
-                auto funcType2 = cast<IRFuncType>(baseFuncForType->getDataType());
-                SLANG_ASSERT(isGlobalInst(funcType2->getResultType()));
-                resultType = updateType(
-                    resultTypeUnionMask,
-                    resultType,
-                    (IRType*)makeInfoForConcreteType(
-                        module,
-                        funcType2->getResultType(),
-                        resultTypeUnionMask));
-            }
-            else
-            {
-                SLANG_UNEXPECTED("Cannot determine result type for context");
-            }
+            auto resultInfo =
+                getReturnInfoForCaller(context, resultTypeUnionMask, getDiagnosticPos(context));
+            SLANG_ASSERT(resultInfo);
+            resultType = updateType(resultTypeUnionMask, resultType, (IRType*)resultInfo);
         }
 
         module->getContainerPool().free(&calleesToProcess);
@@ -8360,39 +9010,6 @@ struct TypeFlowSpecializationContext
         return false;
     }
 
-    void collectExistentialTables(IRInterfaceType* interfaceType, HashSet<IRInst*>& outTables)
-    {
-        IRWitnessTableType* targetTableType = nullptr;
-        // First, find the IRWitnessTableType that wraps the given interfaceType
-        for (auto use = interfaceType->firstUse; use; use = use->nextUse)
-        {
-            if (auto wtType = as<IRWitnessTableType>(use->getUser()))
-            {
-                if (wtType->getConformanceType() == interfaceType)
-                {
-                    targetTableType = wtType;
-                    break;
-                }
-            }
-        }
-
-        // `getSet` requires global operands, so exclude block-local tables synthesized by autodiff.
-        if (targetTableType)
-        {
-            for (auto use = targetTableType->firstUse; use; use = use->nextUse)
-            {
-                if (auto witnessTable = as<IRWitnessTable>(use->getUser()))
-                {
-                    if (witnessTable->getDataType() == targetTableType &&
-                        isGlobalInst(witnessTable))
-                    {
-                        outTables.add(witnessTable);
-                    }
-                }
-            }
-        }
-    }
-
     bool processModule()
     {
         bool hasChanges = false;
@@ -8477,6 +9094,13 @@ struct TypeFlowSpecializationContext
     // bails out on any Part-1 error before that walker runs, so there is no
     // cross-phase deduplication to coordinate.
     HashSet<IRInst*> diagnosedNoTypeConformancesInterfaces;
+
+    // Types already diagnosed by `getPayloadType` as having no payload type.
+    HashSet<IRInst*> diagnosedUnsupportedPayloadTypes;
+
+    // `Optional` types of an interface already diagnosed by `mapPayloadPositions` at the position
+    // of an optional associated type.
+    HashSet<IRInst*> diagnosedOptionalExistentialPayloadTypes;
 
     // Emit error 33180 for an invalid existential specialization, deduplicating by `dedupKey`.
     // Returns true if the diagnostic was emitted (first time for this key).

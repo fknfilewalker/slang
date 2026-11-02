@@ -27,6 +27,12 @@ bool isStructEmpty(IRType* type);
 /// type legalization decisions.
 bool isEmptyType(IRType* type);
 
+/// Append to `outTypes` the types that a value of `type` holds by value: the field types of a
+/// struct, and the type operands of any other type. A pointer-like type, a parameter-direction type
+/// or a function type holds no value of its operand types, so it contributes nothing; that is what
+/// lets a pointer break a cycle such as `struct Node { int v; Node* next; }`.
+void getTypesHeldByValue(IRType* type, List<IRType*>& outTypes);
+
 // A helper class to clone children insts to a different generic parent that has equivalent set of
 // generic parameters. The clone will take care of substitution of equivalent generic parameters and
 // intermediate values between the two generic parents.
@@ -302,6 +308,14 @@ bool isOpaqueType(IRType* type, IRType** outLeafOpaqueHandleType);
 /// Native pointers and parameter-group types remain leaves. Specialization can determine an
 /// `IRArrayType` element count; an `IRUnsizedArrayType` has no count.
 bool isUnsizedType(IRType* type);
+
+/// Return the trailing `TupleNameType` operand of the tuple type `tupleType`, or null if it has
+/// none.
+///
+/// Autodiff names the tuples it makes for its contexts with this operand. The operand is a
+/// sentinel rather than an element: tuple lowering gives it no field in the struct it creates, and
+/// the value at its position is always a poison of the sentinel type.
+IRTupleNameType* findTupleNameSentinel(IRInst* tupleType);
 
 // True if `type` (after unwrapping attributed types) is a texture or a sampler-state-family type,
 // i.e. one the `spvBindlessTextureNV` descriptor-handle-to-resource conversion can produce. This is

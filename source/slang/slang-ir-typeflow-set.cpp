@@ -7,8 +7,16 @@
 namespace Slang
 {
 
+// Return a call to a new helper function that maps the value of the optional `arg` with
+// `innerFunc` and keeps `none` as is. The call is emitted at `callSiteBuilder`'s insertion point
+// if one is given, and right after `arg` otherwise.
+//
 template<typename F>
-IRInst* openOptional(IRModule* module, IRInst* arg, F innerFunc)
+IRInst* openOptional(
+    IRModule* module,
+    IRInst* arg,
+    F innerFunc,
+    IRBuilder* callSiteBuilder = nullptr)
 {
     auto argOptionalType = as<IROptionalType>(arg->getDataType());
     SLANG_ASSERT(argOptionalType);
@@ -63,10 +71,49 @@ IRInst* openOptional(IRModule* module, IRInst* arg, F innerFunc)
     builder.emitUnreachable();
 
     // Replace the ReinterpretOptional instruction with a call to the helper function
+    if (callSiteBuilder)
+        return callSiteBuilder->emitCallInst(destOptionalType, func, 1, &arg);
     builder.setInsertAfter(arg);
     auto callResult = builder.emitCallInst(destOptionalType, func, 1, &arg);
 
     return callResult;
+}
+
+// Return a tuple of type `destTupleType` whose elements are `mapElement(builder, element,
+// destElementType)` for each element of the tuple `arg` and the element type of `destTupleType` at
+// the same position.
+//
+// A named autodiff context such as `tuple_type(Float, %Diffuse, TupleName("s_minCtx_foo"))` ends
+// in a name sentinel, which is not an element (see `findTupleNameSentinel`). We give the result
+// a poison at that position, as the producer `convertStructToNamedTuple` does, rather than
+// extracting the sentinel, which tuple lowering has no field for.
+//
+template<typename F>
+static IRInst* mapTupleElements(
+    IRBuilder* builder,
+    IRInst* arg,
+    IRTupleType* destTupleType,
+    F mapElement)
+{
+    auto argTupleType = as<IRTupleType>(arg->getDataType());
+    SLANG_RELEASE_ASSERT(
+        argTupleType && argTupleType->getOperandCount() == destTupleType->getOperandCount());
+
+    auto sentinel = findTupleNameSentinel(destTupleType);
+    SLANG_RELEASE_ASSERT(sentinel == findTupleNameSentinel(argTupleType));
+
+    UInt elementCount = destTupleType->getOperandCount() - (sentinel ? 1 : 0);
+    List<IRInst*> elements;
+    for (UInt i = 0; i < elementCount; i++)
+    {
+        auto argElement =
+            builder->emitGetTupleElement((IRType*)argTupleType->getOperand(i), arg, i);
+        elements.add(mapElement(builder, argElement, (IRType*)destTupleType->getOperand(i)));
+    }
+    if (sentinel)
+        elements.add(builder->getPoison(sentinel));
+
+    return builder->emitMakeTuple(destTupleType, elements);
 }
 
 // Upcast the value in 'arg' to match the destInfo type. This method inserts
@@ -236,20 +283,12 @@ IRInst* upcastSet(IRBuilder* builder, IRInst* arg, IRType* destInfo)
 
         if (argTupleType != destTupleType)
         {
-            UInt argElementCount = argTupleType->getOperandCount();
-
-            List<IRInst*> upcastedElements;
-            upcastedElements.setCount((Index)argElementCount);
-            for (UInt i = 0; i < argElementCount; i++)
-            {
-                auto argElementType = (IRType*)argTupleType->getOperand(i);
-                auto destElementType = (IRType*)destTupleType->getOperand(i);
-                auto argElement = builder->emitGetTupleElement(argElementType, arg, i);
-                auto upcastedElement = upcastSet(builder, argElement, destElementType);
-                upcastedElements[(Index)i] = upcastedElement;
-            }
-
-            return builder->emitMakeTuple(destTupleType, upcastedElements);
+            return mapTupleElements(
+                builder,
+                arg,
+                destTupleType,
+                [](IRBuilder* b, IRInst* element, IRType* destElementType)
+                { return upcastSet(b, element, destElementType); });
         }
     }
     else if (as<IROptionalType>(argInfo) && as<IROptionalType>(destInfo))
@@ -281,6 +320,61 @@ IRInst* upcastSet(IRBuilder* builder, IRInst* arg, IRType* destInfo)
     }
 
     return arg; // Can use as-is.
+}
+
+IRInst* unpackPayloads(IRBuilder* builder, IRInst* arg, IRType* destType)
+{
+    auto argType = arg->getDataType();
+    if (argType == destType)
+        return arg;
+
+    if (as<IRUntaggedUnionType>(argType) || as<IRAnyValueType>(argType))
+        return builder->emitUnpackAnyValue(destType, arg);
+
+    if (as<IRTupleType>(argType))
+    {
+        auto destTupleType = as<IRTupleType>(destType);
+        SLANG_RELEASE_ASSERT(destTupleType);
+        return mapTupleElements(
+            builder,
+            arg,
+            destTupleType,
+            [](IRBuilder* b, IRInst* element, IRType* destElementType)
+            { return unpackPayloads(b, element, destElementType); });
+    }
+
+    if (auto argArrayType = as<IRArrayType>(argType))
+    {
+        auto destArrayType = as<IRArrayType>(destType);
+        SLANG_RELEASE_ASSERT(destArrayType);
+
+        auto elementCount = getIntVal(argArrayType->getElementCount());
+        List<IRInst*> elements;
+        for (IRIntegerValue i = 0; i < elementCount; i++)
+        {
+            auto argElement = builder->emitGetElement(argArrayType->getElementType(), arg, i);
+            elements.add(unpackPayloads(builder, argElement, destArrayType->getElementType()));
+        }
+        return builder->emitMakeArray(destArrayType, elements.getCount(), elements.getBuffer());
+    }
+
+    if (as<IROptionalType>(argType))
+    {
+        auto destOptionalType = as<IROptionalType>(destType);
+        SLANG_RELEASE_ASSERT(destOptionalType);
+
+        auto destValueType = destOptionalType->getValueType();
+        return openOptional(
+            builder->getModule(),
+            arg,
+            [destValueType](IRBuilder* b, IRInst* value)
+            { return unpackPayloads(b, value, destValueType); },
+            builder);
+    }
+
+    // The only other difference between the dispatcher's parameter type and an implementation's
+    // parameter type is a payload of a type variable, so any other mismatch is a type-flow bug.
+    SLANG_UNEXPECTED("unpackPayloads: unexpected mismatch between argument and parameter type");
 }
 
 } // namespace Slang

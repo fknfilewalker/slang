@@ -101,8 +101,16 @@ struct CFGNormalizationPass
 {
     CFGNormalizationContext cfgContext;
 
-    CFGNormalizationPass(CFGNormalizationContext ctx)
-        : cfgContext(ctx)
+    // The dominator tree of the function before normalization. Normalization only adds guard
+    // blocks inside a region and redirects its breaks to the region's exit, so a block that
+    // dominated a region header before normalization still dominates it afterwards.
+    RefPtr<IRDominatorTree> originalDominatorTree;
+
+    // The locals that `canMoveVarToRegion` left in their block.
+    List<IRVar*> varsKeptInPlace;
+
+    CFGNormalizationPass(CFGNormalizationContext ctx, RefPtr<IRDominatorTree> dominatorTree)
+        : cfgContext(ctx), originalDominatorTree(dominatorTree)
     {
     }
 
@@ -164,13 +172,39 @@ struct CFGNormalizationPass
         return false;
     }
 
+    // Return true if `var` can move to `destBlock`, which is the header of `region` or the first
+    // block of its loop, without being placed above the definition of its type.
+    //
+    // Consider a loop body that opens an existential to call a `[mutating]` method on it. The
+    // body holds a local `var : Ptr(extractExistentialType(rng))` whose type instruction is in the
+    // same block. Moving that local to the region header would put it before its type, and
+    // `legalizeDefUse` cannot repair that: cloning a hoistable type returns the same deduplicated
+    // inst, so it would retry forever. Such a local stays in its block and is recorded in
+    // `varsKeptInPlace`. A local whose type is global, or defined in a block that dominates the
+    // region header, is moved as usual.
+    //
+    bool canMoveVarToRegion(IRVar* var, BreakableRegionInfo* region, IRBlock* destBlock)
+    {
+        auto typeBlock = as<IRBlock>(var->getFullType()->getParent());
+        if (!typeBlock || typeBlock == destBlock)
+            return true;
+
+        auto dom = originalDominatorTree.Ptr();
+        if (!dom->isUnreachable(typeBlock) && !dom->isUnreachable(region->headerBlock) &&
+            dom->dominates(typeBlock, region->headerBlock))
+            return true;
+
+        varsKeptInPlace.add(var);
+        return false;
+    }
+
     void _moveVarsToRegionHeader(BreakableRegionInfo* region, IRBlock* block)
     {
         for (auto child = block->getFirstChild(); child;)
         {
             auto nextChild = child->getNextInst();
 
-            if (as<IRVar>(child))
+            if (auto var = as<IRVar>(child))
             {
                 if (auto loopInst = as<IRLoop>(region->headerBlock->getTerminator()))
                 {
@@ -178,11 +212,15 @@ struct CFGNormalizationPass
                     // to the loop's target (first loop block) instead of the loop header.
                     // (unless the var is already in the header or target)
                     //
-                    if (block != region->headerBlock && block != loopInst->getTargetBlock())
-                        child->insertBefore(loopInst->getTargetBlock()->getTerminator());
+                    auto destBlock = loopInst->getTargetBlock();
+                    if (block != region->headerBlock && block != destBlock &&
+                        canMoveVarToRegion(var, region, destBlock))
+                        var->insertBefore(destBlock->getTerminator());
                 }
-                else
-                    child->insertBefore(region->headerBlock->getTerminator());
+                else if (canMoveVarToRegion(var, region, region->headerBlock))
+                {
+                    var->insertBefore(region->headerBlock->getTerminator());
+                }
             }
 
             child = nextChild;
@@ -711,6 +749,28 @@ struct CFGNormalizationPass
     }
 };
 
+// Assert that the type of each local in `vars` is defined in a block that dominates every use of
+// the local. `legalizeDefUse` can move a local only to a block where its type is available, so a
+// local left in place by `canMoveVarToRegion` must not need to move above its type; if it did,
+// `legalizeDefUse` would not terminate.
+//
+static void assertTypesOfKeptVarsDominateUses(IRGlobalValueWithCode* func, List<IRVar*> const& vars)
+{
+    if (vars.getCount() == 0)
+        return;
+
+    auto dom = computeDominatorTree(func);
+    for (auto var : vars)
+    {
+        auto typeBlock = as<IRBlock>(var->getFullType()->getParent());
+        for (auto use = var->firstUse; use; use = use->nextUse)
+        {
+            auto userBlock = as<IRBlock>(use->getUser()->getParent());
+            SLANG_RELEASE_ASSERT(!userBlock || dom->dominates(typeBlock, userBlock));
+        }
+    }
+}
+
 void normalizeCFG(
     TargetProgram* targetProgram,
     IRModule* module,
@@ -727,7 +787,7 @@ void normalizeCFG(
         PhiEliminationOptions::getFast());
 
     CFGNormalizationContext context = {module, options.sink};
-    CFGNormalizationPass cfgPass(context);
+    CFGNormalizationPass cfgPass(context, computeDominatorTree(func));
 
     List<IRBlock*> workList;
     workList.add(func->getFirstBlock());
@@ -758,6 +818,7 @@ void normalizeCFG(
     // no longer dominate the use. We fix these up by going through the IR and create temp
     // vars for such uses.
     sortBlocksInFunc(func);
+    assertTypesOfKeptVarsDominateUses(func, cfgPass.varsKeptInPlace);
     legalizeDefUse(func, targetProgram);
 
     {

@@ -1258,6 +1258,7 @@ struct SpecializationContext
             if (auto witnessTableSet = as<IRWitnessTableSet>(lookupInst->getWitnessTable()))
             {
                 auto requirementKey = lookupInst->getRequirementKey();
+                auto setOp = getSetOpFromType(lookupInst->getDataType());
 
                 HashSet<IRInst*> satisfyingValSet;
                 bool skipSpecialization = false;
@@ -1270,8 +1271,21 @@ struct SpecializationContext
                         {
                             if (auto satisfyingVal = findWitnessTableEntry(table, requirementKey))
                             {
-                                satisfyingValSet.add(satisfyingVal);
-                                return;
+                                // A lookup over a set of tables is a type variable, so an
+                                // associated type selects the payload type of each entry, as
+                                // in type-flow. The function types of a generic specialized
+                                // with a table set then agree with its body and its callers.
+                                // An entry without a payload type holds an interface with no
+                                // conformance, which type-flow reports.
+                                //
+                                if (setOp == kIROp_TypeSet)
+                                    satisfyingVal =
+                                        getTypeVariablePayloadType(module, (IRType*)satisfyingVal);
+                                if (satisfyingVal)
+                                {
+                                    satisfyingValSet.add(satisfyingVal);
+                                    return;
+                                }
                             }
                         }
 
@@ -1282,7 +1296,6 @@ struct SpecializationContext
                 if (!skipSpecialization)
                 {
                     IRBuilder builder(module);
-                    auto setOp = getSetOpFromType(lookupInst->getDataType());
                     auto newSet = builder.getSet(setOp, satisfyingValSet);
                     addUsersToWorkList(lookupInst);
                     if (as<IRTypeSet>(newSet))

@@ -52,6 +52,39 @@ bool isEmptyType(IRType* type)
     return isStructEmpty(type, isEmptyType);
 }
 
+void getTypesHeldByValue(IRType* type, List<IRType*>& outTypes)
+{
+    switch (type->getOp())
+    {
+    case kIROp_StructType:
+        for (auto field : cast<IRStructType>(type)->getFields())
+            outTypes.add(field->getFieldType());
+        break;
+    case kIROp_PtrType:
+    case kIROp_IntPtrType:
+    case kIROp_UIntPtrType:
+    case kIROp_RawPointerType:
+    case kIROp_NativePtrType:
+    case kIROp_ComPtrType:
+    case kIROp_PseudoPtrType:
+    case kIROp_RTTIPointerType:
+    case kIROp_OutParamType:
+    case kIROp_BorrowInOutParamType:
+    case kIROp_RefParamType:
+    case kIROp_BorrowInParamType:
+    case kIROp_NativeStringType:
+    case kIROp_FuncType:
+        break;
+    default:
+        for (UInt i = 0; i < type->getOperandCount(); i++)
+        {
+            if (auto operandType = as<IRType>(type->getOperand(i)))
+                outTypes.add(operandType);
+        }
+        break;
+    }
+}
+
 bool doesInstOnlyDependOnOperandTypes(IRInst* inst)
 {
     // Some static type queries take a runtime value and inspect only its static type. Others
@@ -354,6 +387,14 @@ bool isPtrToArrayType(IRInst* type)
     return isPointerOfType(type, kIROp_ArrayType) || isPointerOfType(type, kIROp_UnsizedArrayType);
 }
 
+IRTupleNameType* findTupleNameSentinel(IRInst* tupleType)
+{
+    SLANG_ASSERT(as<IRTupleType>(tupleType));
+    UInt operandCount = tupleType->getOperandCount();
+    if (operandCount == 0)
+        return nullptr;
+    return as<IRTupleNameType>(tupleType->getOperand(operandCount - 1));
+}
 
 bool isComInterfaceType(IRType* type)
 {
@@ -872,6 +913,13 @@ void getTypeNameHint(StringBuilder& sb, IRInst* type)
         getTypeNameHint(sb, type->getOperand(0));
         sb << ",";
         getTypeNameHint(sb, as<IRArrayType>(type)->getElementCount());
+        sb << ">";
+        break;
+    case kIROp_ConditionalType:
+        sb << "Conditional<";
+        getTypeNameHint(sb, type->getOperand(0));
+        sb << ",";
+        getTypeNameHint(sb, type->getOperand(1));
         sb << ">";
         break;
     case kIROp_UnsizedArrayType:

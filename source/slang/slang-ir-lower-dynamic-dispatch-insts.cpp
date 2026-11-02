@@ -38,6 +38,44 @@ bool isAnyValueType(IRType* type)
     return false;
 }
 
+// Return a local variable of type `paramValType` to pass in place of the pointer argument `arg`
+// to a parameter of type `paramType`, where the implementation holds the value as `paramValType`
+// and the interface holds it in another representation: an `AnyValue` for `Kind::Pack`, or a
+// structure with untagged unions at its payload positions for `Kind::UpCast` (see
+// `unpackPayloads`).
+//
+// The callee reads the value unless the parameter is `out`, so we initialize the variable with
+// the converted value of `arg`. The callee may write the value unless the parameter is a
+// `__constref`, so `packAfterCall` then asks the wrapper to convert the variable back into `arg`
+// after the call.
+//
+IRInst* emitConvertedPointerArg(
+    IRBuilder* builder,
+    IRType* paramType,
+    IRType* paramValType,
+    IRInst* arg,
+    ArgumentPackWorkItem::Kind kind,
+    ArgumentPackWorkItem& packAfterCall)
+{
+    auto tempVar = builder->emitVar(paramValType);
+    if (!as<IROutParamType>(paramType))
+    {
+        auto argVal = builder->emitLoad(arg);
+        auto convertedVal = kind == ArgumentPackWorkItem::Kind::Pack
+                                ? builder->emitUnpackAnyValue(paramValType, argVal)
+                                : unpackPayloads(builder, argVal, paramValType);
+        builder->emitStore(tempVar, convertedVal);
+    }
+
+    if (!as<IRBorrowInParamType>(paramType))
+    {
+        packAfterCall.kind = kind;
+        packAfterCall.dstArg = arg;
+        packAfterCall.concreteArg = tempVar;
+    }
+    return tempVar;
+}
+
 // Unpack an `arg` of `IRAnyValue` into concrete type if necessary, to make it feedable into the
 // parameter. If `arg` represents a AnyValue typed variable passed in to a concrete `out`
 // parameter, this function indicates that it needs to be packed after the call by setting
@@ -72,26 +110,36 @@ IRInst* maybeUnpackArg(
     // `arg` is an AnyValue.
     if (!isAnyValueType(paramValType) && isAnyValueType(argValType))
     {
-        // if parameter expects an `out` pointer, store the unpacked val into a
-        // variable and pass in a pointer to that variable.
         if (as<IRPtrTypeBase>(paramType))
-        {
-            auto tempVar = builder->emitVar(paramValType);
-            if (as<IRBorrowInOutParamType>(paramType))
-                builder->emitStore(
-                    tempVar,
-                    builder->emitUnpackAnyValue(paramValType, builder->emitLoad(arg)));
+            return emitConvertedPointerArg(
+                builder,
+                paramType,
+                paramValType,
+                arg,
+                ArgumentPackWorkItem::Kind::Pack,
+                packAfterCall);
+        return builder->emitUnpackAnyValue(paramValType, argVal);
+    }
 
-            // tempVar needs to be unpacked into original var after the call.
-            packAfterCall.kind = ArgumentPackWorkItem::Kind::Pack;
-            packAfterCall.dstArg = arg;
-            packAfterCall.concreteArg = tempVar;
-            return tempVar;
-        }
-        else
-        {
-            return builder->emitUnpackAnyValue(paramValType, argVal);
-        }
+    // A type variable's payload can also sit inside a tuple, array or optional parameter, e.g.
+    // `Tuple<Ctx, float>`. The dispatcher's parameter then holds an untagged union where the
+    // implementation's parameter holds the payload type, and we convert the value structurally
+    // (see `unpackPayloads`), and convert it back with `upcastSet` after the call for an `out` or
+    // `inout` parameter.
+    //
+    if (paramValType != argValType &&
+        (as<IRTupleType>(paramValType) || as<IRArrayType>(paramValType) ||
+         as<IROptionalType>(paramValType)))
+    {
+        if (as<IRPtrTypeBase>(paramType))
+            return emitConvertedPointerArg(
+                builder,
+                paramType,
+                paramValType,
+                arg,
+                ArgumentPackWorkItem::Kind::UpCast,
+                packAfterCall);
+        return unpackPayloads(builder, argVal, paramValType);
     }
 
     // Reinterpret 'arg' if it is being passed to a parameter with
@@ -852,15 +900,97 @@ struct UntaggedUnionLoweringContext : public InstPassBase
         noneTypeElement->removeAndDeallocate();
     }
 
+    // Append to `outUnions` every untagged union that a value of `type` holds by value, without
+    // looking inside those unions. A pointer does not hold its pointee (see
+    // `getTypesHeldByValue`).
+    //
+    void collectUntaggedUnionsHeldByValue(
+        IRType* type,
+        List<IRUntaggedUnionType*>& outUnions,
+        HashSet<IRType*>& visited)
+    {
+        if (!visited.add(type))
+            return;
+        if (auto untaggedUnionType = as<IRUntaggedUnionType>(type))
+        {
+            outUnions.add(untaggedUnionType);
+            return;
+        }
+
+        List<IRType*> typesHeldByValue;
+        getTypesHeldByValue(type, typesHeldByValue);
+        for (auto heldType : typesHeldByValue)
+            collectUntaggedUnionsHeldByValue(heldType, outUnions, visited);
+    }
+
+    // Lower `untaggedUnionType` after every untagged union that one of its payload types holds by
+    // value, because the size of its `AnyValueType` is the largest payload size, and a payload
+    // that still holds an unlowered union has no layout.
+    //
+    // Consider an existential `IOuter` implemented by `S1 { IInner inner; }` and `S2`. Its payload
+    // union is `UntaggedUnion({S1, S2})`, and after tagged-union lowering `S1.inner` holds
+    // `UntaggedUnion({A, B})`. That inner union must become an `AnyValueType` before `S1` can be
+    // sized.
+    //
+    void lowerAfterNestedUntaggedUnions(
+        IRUntaggedUnionType* untaggedUnionType,
+        HashSet<IRUntaggedUnionType*>& inProgress,
+        HashSet<IRUntaggedUnionType*>& lowered)
+    {
+        if (lowered.contains(untaggedUnionType))
+            return;
+
+        // A union cannot hold itself by value, since its payload would be infinitely large.
+        // `diagnoseCircularConformances` rejects such programs before this pass.
+        SLANG_RELEASE_ASSERT(inProgress.add(untaggedUnionType));
+
+        List<IRUntaggedUnionType*> nestedUnions;
+        HashSet<IRType*> visited;
+        auto set = untaggedUnionType->getSet();
+        for (UInt i = 0; i < set->getCount(); i++)
+        {
+            if (auto payloadType = as<IRType>(set->getElement(i)))
+                collectUntaggedUnionsHeldByValue(payloadType, nestedUnions, visited);
+        }
+        for (auto nestedUnion : nestedUnions)
+            lowerAfterNestedUntaggedUnions(nestedUnion, inProgress, lowered);
+
+        inProgress.remove(untaggedUnionType);
+        lowered.add(untaggedUnionType);
+
+        // Lowering a nested union rewrites the payload types that use it, and with them this
+        // union. If the rewritten union is identical to another union, the IR's deduplication
+        // moves this union's uses to that one, and this one is left without uses. The other union
+        // is lowered when we reach it, unless it was lowered already (see `processModule`).
+        if (untaggedUnionType->hasUses())
+            lowerUntaggedUnionType(untaggedUnionType);
+    }
+
     void processModule()
     {
+        // We lower the unions in use depth-first (see `lowerAfterNestedUntaggedUnions`).
+        List<IRUntaggedUnionType*> unionsInUse;
         processInstsOfType<IRUntaggedUnionType>(
             kIROp_UntaggedUnionType,
             [&](IRUntaggedUnionType* inst)
             {
                 if (inst->hasUses())
-                    return lowerUntaggedUnionType(inst);
+                    unionsInUse.add(inst);
             });
+
+        HashSet<IRUntaggedUnionType*> inProgress;
+        HashSet<IRUntaggedUnionType*> lowered;
+        for (auto untaggedUnionType : unionsInUse)
+            lowerAfterNestedUntaggedUnions(untaggedUnionType, inProgress, lowered);
+
+        // A lowered union stays in the module without uses. If a union rewritten later were
+        // identical to it, the rewritten union's uses would move back to it, and it would be left
+        // in use but unlowered. That needs two distinct payload sets that become equal once their
+        // nested unions are lowered. No test produces such a pair, so we assert that no union is
+        // left in use instead of emitting one that was never lowered.
+        processInstsOfType<IRUntaggedUnionType>(
+            kIROp_UntaggedUnionType,
+            [&](IRUntaggedUnionType* inst) { SLANG_RELEASE_ASSERT(!inst->hasUses()); });
 
         replaceNoneTypeElementWithVoidType();
     }

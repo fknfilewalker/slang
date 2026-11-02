@@ -5906,6 +5906,13 @@ err(
 )
 
 err(
+    "optional-of-interface-as-associated-type-payload",
+    52011,
+    "optional of an interface-bound associated type incompatible with dynamic dispatch",
+    span { loc = "location", message = "an 'Optional' of an associated type bound to interface '~interfaceType' cannot cross a dynamic dispatch; 'Optional<T.Assoc>' in a dynamically dispatched requirement is not supported when the associated type is bound to an interface." }
+)
+
+err(
     "ref-accessor-with-interface-type-in-dynamic-dispatch",
     52012,
     "ref accessor incompatible with dynamic dispatch",

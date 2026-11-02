@@ -1023,7 +1023,7 @@ bool canTypeBeStored(IRInst* type)
     case kIROp_TupleType:
         for (UIndex i = 0; i < type->getOperandCount(); i++)
         {
-            if (as<IRTupleNameType>(type->getOperand(i)))
+            if (type->getOperand(i) == findTupleNameSentinel(type))
                 continue;
             if (!canTypeBeStored(type->getOperand(i)))
                 return false;
