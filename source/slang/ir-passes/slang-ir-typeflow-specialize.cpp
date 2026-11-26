@@ -195,6 +195,10 @@ IRInst* getInvalidExistentialSpecializationTarget(IRInst* specializedValue)
     if (auto lookupWitness = as<IRLookupWitnessMethod>(specializationBase))
         specializationBase = lookupWitness->getRequirementKey();
 
+    // A witness table is reported under the name of its conforming type.
+    if (auto witnessTable = as<IRWitnessTable>(specializationBase))
+        return getInvalidExistentialSpecializationTarget(witnessTable->getConcreteType());
+
     return specializationBase;
 }
 
@@ -4111,6 +4115,17 @@ struct TypeFlowSpecializationContext
                 {
                     SLANG_UNEXPECTED("Unhandled PropagationJudgment in analyzeSpecialize");
                 }
+            }
+
+            // A witness table carries no tag, so one specialized with a set of witness tables
+            // cannot tell its methods which table is active. We report it as an error.
+            auto isSetArg = [](IRInst* arg) { return as<IRSetBase>(arg) != nullptr; };
+            if (as<IRWitnessTableType>(inst->getDataType()) &&
+                specializationArgs.findFirstIndex(isSetArg) != -1)
+            {
+                emitExistentialSpecializationDiagnostic(inst, inst->sourceLoc, inst);
+                module->getContainerPool().free(&specializationArgs);
+                return none();
             }
 
             // This part creates a correct type for the specialization, by following the same
