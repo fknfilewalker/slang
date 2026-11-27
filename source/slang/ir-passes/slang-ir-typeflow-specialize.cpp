@@ -1198,6 +1198,33 @@ struct TypeFlowSpecializationContext
         return nullptr;
     }
 
+    // Return the untagged union of the payload types of the types in `typeSet`. Lazily translated
+    // entries, such as a `BackwardDiffMinimalContextType`, are translated here, where a value of
+    // the type exists, so that derivatives the program never calls stay untranslated.
+    //
+    IRUntaggedUnionType* makePayloadUnionType(IRTypeSet* typeSet, SourceLoc loc)
+    {
+        HashSet<IRInst*>& payloadTypes = *module->getContainerPool().getHashSet<IRInst>();
+        forEachInSet(
+            module,
+            typeSet,
+            [&](IRInst* type)
+            {
+                // A null resolution means translation failed and already reported an error.
+                if (auto resolvedType = translationContext.resolveInst(type))
+                {
+                    if (auto payloadType = getPayloadType(resolvedType, loc))
+                        payloadTypes.add(payloadType);
+                }
+            });
+
+        IRBuilder builder(module);
+        auto result =
+            makeUntaggedUnionType(cast<IRTypeSet>(builder.getSet(kIROp_TypeSet, payloadTypes)));
+        module->getContainerPool().free(&payloadTypes);
+        return result;
+    }
+
     // A value crosses a call as a payload where the call site sees a type variable and the callee
     // declares a type of its own. A callee that declares a type variable, such as a generic
     // parameter, receives the value unchanged.
@@ -1998,7 +2025,13 @@ struct TypeFlowSpecializationContext
             if (auto elementOfSetType =
                     as<IRElementOfSetType, IRDynamicCastBehavior::NoUnwrap>(dataTypeInfo))
             {
-                return makeUntaggedUnionType(cast<IRTypeSet>(elementOfSetType->getSet()));
+                // A value of an associated type is a payload: the witness tables' entries are
+                // declared types that can hold interfaces, such as a backward context. Other sets
+                // already hold the values' own types.
+                auto typeSet = cast<IRTypeSet>(elementOfSetType->getSet());
+                if (as<IRLookupWitnessMethod>(inst->getDataType()))
+                    return makePayloadUnionType(typeSet, inst->sourceLoc);
+                return makeUntaggedUnionType(typeSet);
             }
         }
 
